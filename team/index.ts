@@ -327,6 +327,7 @@ function buildOrchestratorContext(state: TeamState, triggerReason: string, extra
 
 	// Trigger reason
 	lines.push(`**Reason:** ${triggerReason}`);
+	lines.push("⚡ You were re-invoked because of the event above. Decide the next action — do not poll for updates.");
 	lines.push("");
 
 	if (state.isComplete) {
@@ -480,7 +481,17 @@ function processOrchestratorMailbox(
 
 	if (hasActionableMessage) {
 		const extraInfo = parts.join("\n\n");
-		triggerOrchestration(pi, ctx, state, "Agent update", extraInfo);
+		let reason = "Agent update";
+		if (messages.some(m => m.type === "done") && messages.some(m => m.type === "challenge")) {
+			reason = "Agent reported completion and raised a challenge";
+		} else if (messages.some(m => m.type === "done")) {
+			reason = "Agent reported completion";
+		} else if (messages.some(m => m.type === "challenge")) {
+			reason = "Agent raised a challenge";
+		} else if (messages.some(m => m.type === "notify")) {
+			reason = "Agent sent a notification";
+		}
+		triggerOrchestration(pi, ctx, state, reason, extraInfo);
 	}
 }
 
@@ -576,7 +587,7 @@ export default function teamExtension(pi: ExtensionAPI) {
 			"Only available when you are the orchestrator.",
 		promptSnippet: "Dispatch an agent or complete the team task",
 		promptGuidelines: [
-			"Always dispatch one agent at a time. Wait for the agent to report back before dispatching another.",
+			"Always dispatch one agent at a time. After dispatching, STOP — do not use team_read_deliverables or read files to check on the agent. You will be automatically re-invoked when the agent reports back.",
 			"When an agent reports completion, review their summary and decide the next step.",
 			"If an agent raises a challenge or question, address it before continuing.",
 			"Use 'complete' action only when the overall task is fully accomplished.",
@@ -722,7 +733,7 @@ export default function teamExtension(pi: ExtensionAPI) {
 				return {
 					content: [{
 						type: "text",
-						text: `✅ Dispatched "${params.agent}" with instructions.\nDispatches: ${state.dispatchCount}/${state.maxDispatches} (${remaining} remaining)`,
+						text: `✅ Dispatched "${params.agent}" with instructions.\nDispatches: ${state.dispatchCount}/${state.maxDispatches} (${remaining} remaining)\n\n⏳ Wait for the agent to report back. You will be automatically re-invoked when they report back — do not poll or check for updates.`,
 					}],
 				};
 			}
@@ -940,7 +951,8 @@ export default function teamExtension(pi: ExtensionAPI) {
 		label: "Read Team Deliverables",
 		description:
 			"Read the task description and all agent reports. Use at the start of your work to get " +
-			"context from previous agents, or when the orchestrator asks you to review what's been done.",
+			"context from previous agents, or when the orchestrator asks you to review what's been done. " +
+			"Do NOT use this to poll for agent progress after dispatching — you will be automatically re-invoked when agents report back.",
 		promptSnippet: "Read task description and agent reports",
 		parameters: Type.Object({}),
 		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
