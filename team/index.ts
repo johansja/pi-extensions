@@ -247,6 +247,15 @@ async function cmuxEqualizeSplits(): Promise<void> {
 	}
 }
 
+async function cmuxSurfaceExists(surfaceId: string): Promise<boolean> {
+	try {
+		const { stdout } = await cmuxExec("list-surfaces");
+		return stdout.includes(surfaceId);
+	} catch {
+		return false;
+	}
+}
+
 async function cmuxNotify(title: string, body: string): Promise<void> {
 	try {
 		await cmuxExec("notify", "--title", title, "--body", body);
@@ -363,7 +372,6 @@ async function spawnAgent(
 	ctx: ExtensionContext,
 	agent: AgentRosterEntry,
 	task: string,
-	instructions: string,
 	splitDirection?: string,
 	splitFromSurfaceId?: string,
 ): Promise<{ surfaceId: string | null }> {
@@ -379,6 +387,7 @@ async function spawnAgent(
 		`Task description: \`.pi/workflow/${task}/task.md\``,
 		`Other agents' reports: \`.pi/workflow/${task}/reports/\``,
 		``,
+		`**Do not start work yet.** The task description has not been provided yet — it will arrive as a dispatch message from the orchestrator. Wait for that message before doing anything.`,
 		`When you complete your work, call the \`team_report\` tool with a summary.`,
 		`If you need to challenge instructions or notify the orchestrator, use the \`team_message\` tool.`,
 		`All messages you send go to the orchestrator, who decides the next steps.`,
@@ -675,7 +684,7 @@ export default function teamExtension(pi: ExtensionAPI) {
 					timestamp: Date.now(),
 				});
 
-				// Write dispatch to agent's mailbox BEFORE spawning (ensures it's there at startup)
+				// Write dispatch to agent's mailbox (agent is already running and watching)
 				const agentMailbox = mailboxPath(ctx.cwd, task, params.agent);
 				appendToMailbox(agentMailbox, {
 					type: "dispatch",
@@ -685,18 +694,19 @@ export default function teamExtension(pi: ExtensionAPI) {
 					timestamp: Date.now(),
 				});
 
-				// Spawn the agent if not already running, otherwise mailbox watcher will pick it up
-				const hasSurface = !!state.surfaceIds[params.agent];
-				if (!hasSurface) {
-					// Determine split direction: first agent goes right, subsequent go down
+				// Re-spawn agent if surface is missing or stale (pane was closed or agent crashed)
+				const existingSurfaceId = state.surfaceIds[params.agent];
+				if (existingSurfaceId && !(await cmuxSurfaceExists(existingSurfaceId))) {
+					delete state.surfaceIds[params.agent];
+				}
+				if (!state.surfaceIds[params.agent]) {
 					const existingSurfaces = Object.values(state.surfaceIds);
-					const isFirstAgent = existingSurfaces.length === 0;
-					const splitDir = isFirstAgent ? "right" : "down";
-					const lastSurface = existingSurfaces[existingSurfaces.length - 1];
+					const lastSurface = existingSurfaces.length > 0 ? existingSurfaces[existingSurfaces.length - 1] : undefined;
 
 					const { surfaceId } = await spawnAgent(
-						pi, ctx, rosterEntry, task, params.instructions,
-						splitDir, isFirstAgent ? undefined : lastSurface,
+						pi, ctx, rosterEntry, task,
+						existingSurfaces.length === 0 ? "right" : "down",
+						lastSurface,
 					);
 
 					if (surfaceId) {
@@ -704,7 +714,6 @@ export default function teamExtension(pi: ExtensionAPI) {
 						await cmuxEqualizeSplits();
 					}
 				}
-				// If agent already has a surface, the mailbox watcher will deliver the dispatch
 
 				saveState(ctx.cwd, state);
 				currentTeamState = state;
@@ -1016,19 +1025,21 @@ export default function teamExtension(pi: ExtensionAPI) {
 
 		// Check if the worker reported via team_report
 		const state = loadState(ctx.cwd, task);
-		if (state && state.agentStatus[role] === "working") {
-			// Worker ended without calling team_report — notify orchestrator
+		if (state && (state.agentStatus[role] === "working" || state.agentStatus[role] === "idle")) {
+			const statusDesc = state.agentStatus[role] === "working" ? "ended without calling team_report" : "exited before being dispatched";
+			// Worker ended without calling team_report, or exited while still idle — notify orchestrator
 			const orchestratorMailbox = mailboxPath(ctx.cwd, task, "orchestrator");
 			appendToMailbox(orchestratorMailbox, {
 				type: "notify",
 				from: role,
 				to: "orchestrator",
-				body: `Agent "${role}" ended without calling team_report. They may have encountered an issue. Consider re-dispatching with /team redo ${task} ${role}.`,
+				body: `Agent "${role}" ${statusDesc}. They may have encountered an issue. Consider re-dispatching with /team redo ${task} ${role}.`,
 				timestamp: Date.now(),
 			});
 
 			// Mark as idle so they can be re-dispatched
 			state.agentStatus[role] = "idle";
+			delete state.surfaceIds[role];  // Surface is gone
 			saveState(ctx.cwd, state);
 		}
 	});
@@ -1127,6 +1138,31 @@ export default function teamExtension(pi: ExtensionAPI) {
 
 					// Start watching orchestrator mailbox
 					setupMailboxWatching(pi, ctx, taskName, "orchestrator");
+
+					// Spawn all agents in cmux panes
+					let lastSuccessfulSurfaceId: string | undefined;
+					for (let i = 0; i < roster.length; i++) {
+						const agent = roster[i];
+						const isFirstAgent = i === 0;
+						const splitDir = isFirstAgent ? "right" : "down";
+
+						const { surfaceId } = await spawnAgent(
+							pi, ctx, agent, taskName,
+							splitDir, isFirstAgent ? undefined : lastSuccessfulSurfaceId,
+						);
+
+						if (surfaceId) {
+							currentTeamState.surfaceIds[agent.name] = surfaceId;
+							lastSuccessfulSurfaceId = surfaceId;
+						}
+					}
+
+					// Equalize pane widths
+					if (Object.keys(currentTeamState.surfaceIds).length > 0) {
+						await cmuxEqualizeSplits();
+					}
+
+					saveState(ctx.cwd, currentTeamState);
 
 					// Name the session
 					pi.setSessionName(`🔷 Orchestrator: ${taskName}`);
@@ -1288,16 +1324,19 @@ export default function teamExtension(pi: ExtensionAPI) {
 						timestamp: Date.now(),
 					});
 
-					// Spawn if not already running
+					// Re-spawn agent if surface is missing or stale (pane was closed or agent crashed)
+					const existingSurfaceId = state.surfaceIds[agentName];
+					if (existingSurfaceId && !(await cmuxSurfaceExists(existingSurfaceId))) {
+						delete state.surfaceIds[agentName];
+					}
 					if (!state.surfaceIds[agentName]) {
 						const existingSurfaces = Object.values(state.surfaceIds);
-						const isFirstAgent = existingSurfaces.length === 0;
-						const splitDir = isFirstAgent ? "right" : "down";
-						const lastSurface = existingSurfaces[existingSurfaces.length - 1];
+						const lastSurface = existingSurfaces.length > 0 ? existingSurfaces[existingSurfaces.length - 1] : undefined;
 
 						const { surfaceId } = await spawnAgent(
-							pi, ctx, rosterEntry, taskName, instructions,
-							splitDir, isFirstAgent ? undefined : lastSurface,
+							pi, ctx, rosterEntry, taskName,
+							existingSurfaces.length === 0 ? "right" : "down",
+							lastSurface,
 						);
 
 						if (surfaceId) {
