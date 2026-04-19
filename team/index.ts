@@ -249,7 +249,7 @@ async function cmuxEqualizeSplits(): Promise<void> {
 
 async function cmuxSurfaceExists(surfaceId: string): Promise<boolean> {
 	try {
-		const { stdout } = await cmuxExec("list-surfaces");
+		const { stdout } = await cmuxExec("list-pane-surfaces");
 		return stdout.includes(surfaceId);
 	} catch {
 		return false;
@@ -705,7 +705,7 @@ export default function teamExtension(pi: ExtensionAPI) {
 					timestamp: Date.now(),
 				});
 
-				// Re-spawn agent if surface is missing or stale (pane was closed or agent crashed)
+				// Spawn agent if no surface exists (pane was closed, agent crashed, etc.)
 				const existingSurfaceId = state.surfaceIds[params.agent];
 				if (existingSurfaceId && !(await cmuxSurfaceExists(existingSurfaceId))) {
 					delete state.surfaceIds[params.agent];
@@ -1336,7 +1336,7 @@ export default function teamExtension(pi: ExtensionAPI) {
 						timestamp: Date.now(),
 					});
 
-					// Re-spawn agent if surface is missing or stale (pane was closed or agent crashed)
+					// Spawn agent if no surface exists (pane was closed, agent crashed, etc.)
 					const existingSurfaceId = state.surfaceIds[agentName];
 					if (existingSurfaceId && !(await cmuxSurfaceExists(existingSurfaceId))) {
 						delete state.surfaceIds[agentName];
