@@ -1,22 +1,27 @@
 /**
- * Team Extension
+ * Team Extension — Dynamic LLM-orchestrated multi-agent workflows
  *
- * Orchestrates multi-role development workflows in cmux panes.
- * Each role (planner, coder, reviewer) runs as a full pi session
- * with its own pane, model, tools, and mailbox.
+ * Compose a team from any agents discovered via .md files. The orchestrator
+ * (the main pi session) uses LLM reasoning to decide which agent to dispatch
+ * next, when to re-dispatch, and when the task is complete.
  *
- * Communication between roles is file-based via .pi/workflow/<task>/mailbox/.
- * The orchestrator manages pane lifecycle via the cmux socket API.
+ * All worker communication routes through the orchestrator — workers never
+ * talk to each other directly.
  *
- * Usage:
- *   /team init <task-name>           — Create workflow, become orchestrator
- *   /team spawn <role> <task-name>   — Spawn a role in a new cmux pane
- *   /team status [task-name]         — Show workflow state
- *   /team send <role> <task-name> <msg> — Send a message to a role's mailbox
- *   /team approve <task-name>        — Approve plan, advance to implementing
- *   /team reject <task-name> <fb>    — Reject plan, send feedback to planner
- *   /team redo <role> <task-name>    — Re-dispatch a role
- *   /team shutdown <task-name>       — Graceful shutdown of all workers
+ * Commands:
+ *   /team init <task> <agent>...     — Create team, become orchestrator
+ *   /team send <task> <details>      — Send task to orchestrator, starts orchestration
+ *   /team status [task]              — Show workflow state
+ *   /team redo <task> <agent> [msg]  — Re-dispatch an agent (manual override)
+ *   /team shutdown [task]            — Graceful shutdown of all workers
+ *   /team list                       — List available agents
+ *   /team history [task]             — Show dispatch history
+ *
+ * Tools (registered for LLM use):
+ *   team_orchestrate  — Dispatch an agent or complete the task (orchestrator only)
+ *   team_report       — Report task completion back to orchestrator (worker only)
+ *   team_message      — Send challenge/notify/ack to orchestrator (worker) or agent (orchestrator)
+ *   team_read_deliverables — Read task description and all agent reports
  */
 
 import * as fs from "node:fs";
@@ -27,47 +32,42 @@ import { promisify } from "node:util";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { StringEnum } from "@mariozechner/pi-ai";
 import { Type } from "@sinclair/typebox";
-import { discoverAgents, type AgentConfig, type AgentDiscoveryResult } from "./agents.js";
+import { discoverAgents, type AgentConfig } from "./agents.js";
 
 const execFileAsync = promisify(execFile);
 
-// ─── Phase tracking constants ────────────────────────────────────────────────
+// ─── Types & Constants ───────────────────────────────────────────────────────
 
-const PHASES = ["planning", "plan-review", "implementing", "reviewing", "fixing", "final-review", "done"] as const;
-type WorkflowPhase = (typeof PHASES)[number];
+const MAX_DISPATCHES = parseInt(process.env.PI_TEAM_MAX_DISPATCHES ?? "30", 10);
 
-interface PhaseEntry {
-	phase: WorkflowPhase;
-	timestamp: number;
-	by: string;
+interface AgentRosterEntry {
+	name: string;
+	description: string;
+	source: "user" | "project";
+	model?: string;
+	tools?: string[];
+	thinking?: string;
+	filePath: string;
 }
 
-interface PhaseData {
-	phase: WorkflowPhase;
-	history: PhaseEntry[];
-	reviewCycles: number;
-}
-
-interface TeamMessage {
-	type: "dispatch" | "challenge" | "done" | "notify" | "shutdown" | "ack";
-	from: string;
-	to: string;
-	body?: string;
-	task?: string;
-	summary?: string;
+interface DispatchEntry {
+	agent: string;
+	instructions: string;
 	timestamp: number;
-	referenceId?: string;
+	result?: string;
 }
 
 interface TeamState {
 	task: string;
 	role: "orchestrator";
-	spawnedRoles: string[];
-	surfaceIds: Record<string, string>; // role -> cmux surface_id
-	phase: (typeof PHASES)[number];
-	completedRoles: string[];
-	reviewRound: number;
-	autoOrchestrate: boolean; // whether to auto-advance the pipeline
+	agents: AgentRosterEntry[];
+	agentStatus: Record<string, "idle" | "working" | "done">;
+	surfaceIds: Record<string, string>;
+	taskDescription: string;
+	dispatchHistory: DispatchEntry[];
+	isComplete: boolean;
+	dispatchCount: number;
+	maxDispatches: number;
 }
 
 interface WorkerState {
@@ -75,19 +75,102 @@ interface WorkerState {
 	role: string;
 }
 
-// ─── Mailbox helpers ─────────────────────────────────────────────────────────
+interface TeamMessage {
+	type: "dispatch" | "challenge" | "done" | "notify" | "ack" | "shutdown";
+	from: string;
+	to: string;
+	body?: string;          // challenge/notify/ack/shutdown message content
+	instructions?: string;  // dispatch instructions
+	summary?: string;       // done report summary
+	questions?: string[];   // done report questions
+	timestamp: number;
+}
+
+// ─── File path helpers ───────────────────────────────────────────────────────
 
 function workflowDir(cwd: string, task: string): string {
 	return path.join(cwd, ".pi", "workflow", task);
+}
+
+function statePath(cwd: string, task: string): string {
+	return path.join(workflowDir(cwd, task), "state.json");
 }
 
 function mailboxDir(cwd: string, task: string): string {
 	return path.join(workflowDir(cwd, task), "mailbox");
 }
 
-function mailboxPath(cwd: string, task: string, role: string): string {
-	return path.join(mailboxDir(cwd, task), `${role}.json`);
+function mailboxPath(cwd: string, task: string, agent: string): string {
+	return path.join(mailboxDir(cwd, task), `${agent}.json`);
 }
+
+function reportsDir(cwd: string, task: string): string {
+	return path.join(workflowDir(cwd, task), "reports");
+}
+
+function reportPath(cwd: string, task: string, agent: string): string {
+	return path.join(reportsDir(cwd, task), `${agent}.md`);
+}
+
+function taskFilePath(cwd: string, task: string): string {
+	return path.join(workflowDir(cwd, task), "task.md");
+}
+
+// ─── State persistence ───────────────────────────────────────────────────────
+
+function saveState(cwd: string, state: TeamState): void {
+	const sp = statePath(cwd, state.task);
+	fs.writeFileSync(sp, JSON.stringify(state, null, 2), { encoding: "utf-8" });
+}
+
+function loadState(cwd: string, task: string): TeamState | null {
+	const sp = statePath(cwd, task);
+	try {
+		const content = fs.readFileSync(sp, "utf-8").trim();
+		if (!content) return null;
+		return JSON.parse(content);
+	} catch {
+		return null;
+	}
+}
+
+function saveSessionState(pi: ExtensionAPI, state: TeamState): void {
+	pi.appendEntry("team-orchestrator", { task: state.task });
+}
+
+function loadSessionTask(ctx: ExtensionContext): string | null {
+	const entries = ctx.sessionManager.getEntries();
+	const entry = entries
+		.filter((e: { type: string; customType?: string }) => e.type === "custom" && e.customType === "team-orchestrator")
+		.pop() as { data?: { task: string } } | undefined;
+	return entry?.data?.task ?? null;
+}
+
+function saveWorkerState(pi: ExtensionAPI, state: WorkerState): void {
+	pi.appendEntry("team-worker", state);
+}
+
+function loadWorkerState(ctx: ExtensionContext): WorkerState | null {
+	const entries = ctx.sessionManager.getEntries();
+	const entry = entries
+		.filter((e: { type: string; customType?: string }) => e.type === "custom" && e.customType === "team-worker")
+		.pop() as { data?: WorkerState } | undefined;
+	return entry?.data ?? null;
+}
+
+function agentConfigToRosterEntry(agent: AgentConfig): AgentRosterEntry {
+	return {
+		name: agent.name,
+		description: agent.description,
+		source: agent.source,
+		model: agent.model,
+		tools: agent.tools,
+		thinking: agent.thinking,
+		filePath: agent.filePath,
+	};
+}
+
+// ─── Mailbox helpers ─────────────────────────────────────────────────────────
 
 function readMailbox(filePath: string): TeamMessage[] {
 	try {
@@ -109,95 +192,6 @@ function clearMailbox(filePath: string): void {
 	fs.writeFileSync(filePath, "[]", { encoding: "utf-8" });
 }
 
-// ─── Phase file helpers ──────────────────────────────────────────────────────
-
-function workflowPhasePath(cwd: string, task: string): string {
-	return path.join(workflowDir(cwd, task), "phase.json");
-}
-
-function readPhase(phaseFile: string): PhaseData {
-	try {
-		const content = fs.readFileSync(phaseFile, "utf-8").trim();
-		if (!content) {
-			return { phase: "planning", history: [], reviewCycles: 0 };
-		}
-		return JSON.parse(content);
-	} catch {
-		return { phase: "planning", history: [], reviewCycles: 0 };
-	}
-}
-
-function writePhase(phaseFile: string, data: PhaseData): void {
-	fs.writeFileSync(phaseFile, JSON.stringify(data, null, 2), { encoding: "utf-8" });
-}
-
-// ─── Workflow initialization ─────────────────────────────────────────────────
-
-function initWorkflow(cwd: string, task: string): void {
-	const dir = workflowDir(cwd, task);
-	const mdir = mailboxDir(cwd, task);
-
-	fs.mkdirSync(dir, { recursive: true });
-	fs.mkdirSync(mdir, { recursive: true });
-
-	// Initialize mailbox files for all known roles
-	const roles = ["orchestrator", "planner", "coder", "reviewer"];
-	for (const role of roles) {
-		const mp = path.join(mdir, `${role}.json`);
-		if (!fs.existsSync(mp)) {
-			fs.writeFileSync(mp, "[]", { encoding: "utf-8" });
-		}
-	}
-
-	// Initialize phase tracking
-	const phaseFile = path.join(dir, "phase.json");
-	if (!fs.existsSync(phaseFile)) {
-		writePhase(phaseFile, {
-			phase: "planning",
-			history: [{ phase: "planning", timestamp: Date.now(), by: "orchestrator" }],
-			reviewCycles: 0,
-		});
-	}
-}
-
-// ─── Session state persistence ───────────────────────────────────────────────
-
-function saveOrchestratorState(pi: ExtensionAPI, state: TeamState): void {
-	pi.appendEntry("team-orchestrator", state);
-}
-
-function saveWorkerState(pi: ExtensionAPI, state: WorkerState): void {
-	pi.appendEntry("team-worker", state);
-}
-
-function loadOrchestratorState(ctx: ExtensionContext): TeamState | null {
-	const entries = ctx.sessionManager.getEntries();
-	const entry = entries
-		.filter((e: { type: string; customType?: string }) => e.type === "custom" && e.customType === "team-orchestrator")
-		.pop() as { data?: TeamState } | undefined;
-	if (!entry?.data) return null;
-	// Ensure new fields have defaults when loading old state
-	const state = entry.data;
-	return {
-		task: state.task,
-		role: "orchestrator",
-		spawnedRoles: state.spawnedRoles ?? [],
-		surfaceIds: state.surfaceIds ?? {},
-		phase: state.phase ?? "planning",
-		completedRoles: state.completedRoles ?? [],
-		reviewRound: state.reviewRound ?? 0,
-		autoOrchestrate: state.autoOrchestrate ?? true,
-	};
-}
-
-function loadWorkerState(ctx: ExtensionContext): WorkerState | null {
-	const entries = ctx.sessionManager.getEntries();
-	const entry = entries
-		.filter((e: { type: string; customType?: string }) => e.type === "custom" && e.customType === "team-worker")
-		.pop() as { data?: WorkerState } | undefined;
-	return entry?.data ?? null;
-}
-
 // ─── cmux CLI helpers ────────────────────────────────────────────────────────
 
 async function cmuxExec(...args: string[]): Promise<{ stdout: string; stderr: string }> {
@@ -208,14 +202,15 @@ async function cmuxExec(...args: string[]): Promise<{ stdout: string; stderr: st
 	}
 }
 
-async function cmuxSplitPane(direction: string = "right"): Promise<string | null> {
+async function cmuxSplitPane(direction: string = "right", splitFromSurfaceId?: string): Promise<string | null> {
 	try {
-		const { stdout } = await cmuxExec("new-split", direction);
-		// Parse surface from output like "OK surface:47 workspace:2"
+		const args = splitFromSurfaceId
+			? ["new-split", direction, "--surface", splitFromSurfaceId]
+			: ["new-split", direction];
+		const { stdout } = await cmuxExec(...args);
 		const match = stdout.match(/surface:(\d+)/i);
 		return match ? `surface:${match[1]}` : null;
 	} catch {
-		// cmux might not be running
 		return null;
 	}
 }
@@ -225,14 +220,6 @@ async function cmuxSendToSurface(surfaceId: string, text: string): Promise<void>
 		await cmuxExec("send", "--surface", surfaceId, text);
 	} catch (err: any) {
 		throw new Error(`cmux send failed: ${err.message}`);
-	}
-}
-
-async function cmuxSendKeyToSurface(surfaceId: string, key: string): Promise<void> {
-	try {
-		await cmuxExec("send-key", "--surface", surfaceId, key);
-	} catch {
-		// Best effort
 	}
 }
 
@@ -256,7 +243,7 @@ async function cmuxEqualizeSplits(): Promise<void> {
 	try {
 		await cmuxExec("rpc", "workspace.equalize_splits");
 	} catch {
-		// Best effort — non-cmux environments will silently ignore
+		// Best effort
 	}
 }
 
@@ -268,304 +255,7 @@ async function cmuxNotify(title: string, body: string): Promise<void> {
 	}
 }
 
-// ─── Notify helper ───────────────────────────────────────────────────────────
-
-function notify(title: string, body: string): void {
-	if (process.env.WT_SESSION) {
-		// Windows
-		return;
-	} else if (process.env.KITTY_WINDOW_ID) {
-		process.stdout.write(`\x1b]99;i=1:d=0;${title}\x1b\\`);
-		process.stdout.write(`\x1b]99;i=1:p=body;${body}\x1b\\`);
-	} else {
-		process.stdout.write(`\x1b]777;notify;${title};${body}\x07`);
-	}
-}
-
-// ─── Default dispatch messages ───────────────────────────────────────────────
-
-function getDefaultDispatchMessage(role: string, task: string): string {
-	switch (role) {
-		case "planner":
-			return `Research and create an implementation plan for task "${task}". Write your plan to .pi/workflow/${task}/plan.md, then advance the workflow phase.`;
-		case "coder":
-			return `Read .pi/workflow/${task}/plan.md and implement it. Write implementation details to .pi/workflow/${task}/implementation.md.`;
-		case "reviewer":
-			return `Review the implementation against .pi/workflow/${task}/plan.md. Read .pi/workflow/${task}/implementation.md for what was done. Write findings to .pi/workflow/${task}/review.md.`;
-		default:
-			return `Start working on task "${task}".`;
-	}
-}
-
-// ─── Deliverable mapping ──────────────────────────────────────────────────────
-
-const DELIVERABLES: Record<string, string> = {
-	planner: "plan.md",
-	coder: "implementation.md",
-	reviewer: "review.md",
-};
-
-function deliverableExists(cwd: string, task: string, role: string): boolean {
-	const filename = DELIVERABLES[role];
-	if (!filename) return true; // roles without defined deliverables (e.g. orchestrator)
-	return fs.existsSync(path.join(workflowDir(cwd, task), filename));
-}
-
-// ─── Spawn coder helper (used by /team approve and potentially other places) ─
-
-async function spawnCoder(
-	pi: ExtensionAPI,
-	ctx: ExtensionContext,
-	state: TeamState,
-): Promise<void> {
-	const discovery = discoverAgents(ctx.cwd, "both");
-	const agent = discovery.agents.find((a) => a.name === "coder");
-	if (!agent) {
-		ctx.ui.notify(`⚠️ No coder agent found. Spawn manually with /team spawn coder ${state.task}`, "warning");
-		return;
-	}
-
-	state.phase = "implementing";
-	saveOrchestratorState(pi, state);
-	updateOrchestratorStatus(ctx, state);
-
-	await logEvent(ctx, "✅ Plan approved. Spawning coder...", "success");
-
-	const plannerSurface = state.surfaceIds["planner"];
-	const { surfaceId } = await spawnAgent(pi, ctx, agent, state.task,
-		`Read .pi/workflow/${state.task}/plan.md and implement it.`,
-		plannerSurface ? "down" : "right",
-		plannerSurface ?? undefined);
-
-	if (!state.spawnedRoles.includes("coder")) state.spawnedRoles.push("coder");
-	if (surfaceId) state.surfaceIds["coder"] = surfaceId;
-	saveOrchestratorState(pi, state);
-
-	// Equalize all pane widths so each panel gets equal space
-	if (surfaceId) await cmuxEqualizeSplits();
-
-	// Update phase.json
-	const phaseFile = workflowPhasePath(ctx.cwd, state.task);
-	const phaseData = readPhase(phaseFile);
-	phaseData.phase = "implementing";
-	phaseData.history.push({ phase: "implementing", timestamp: Date.now(), by: "orchestrator" });
-	writePhase(phaseFile, phaseData);
-
-	// Dispatch task to coder's mailbox
-	const coderMailbox = mailboxPath(ctx.cwd, state.task, "coder");
-	appendToMailbox(coderMailbox, {
-		type: "dispatch",
-		from: "orchestrator",
-		to: "coder",
-		task: `Read .pi/workflow/${state.task}/plan.md and implement it.`,
-		timestamp: Date.now(),
-	});
-}
-
-// ─── Auto-orchestration ──────────────────────────────────────────────────────
-
-async function handleRoleDone(
-	pi: ExtensionAPI,
-	ctx: ExtensionContext,
-	completedRole: string,
-	summary: string,
-): Promise<void> {
-	const state = loadOrchestratorState(ctx);
-	if (!state) return;
-
-	// Mark role as completed
-	if (!state.completedRoles.includes(completedRole)) {
-		state.completedRoles.push(completedRole);
-	}
-
-	// Change 8: Deliverable existence check
-	if (!deliverableExists(ctx.cwd, state.task, completedRole)) {
-		const deliverable = DELIVERABLES[completedRole];
-		pi.sendUserMessage(
-			`⚠️ ${completedRole} reported done but ${deliverable ?? "deliverable"} was not found. Use /team redo ${completedRole} ${state.task} to re-dispatch.`
-		);
-		saveOrchestratorState(pi, state);
-		return;
-	}
-
-	// Determine what to do next based on phase and which role finished
-	if (!state.autoOrchestrate) {
-		// Manual mode — just notify the human
-		pi.sendUserMessage(`✅ ${completedRole} is done: ${summary}\nUse /team spawn to continue the pipeline.`);
-		saveOrchestratorState(pi, state);
-		return;
-	}
-
-	const discovery = discoverAgents(ctx.cwd, "both");
-
-	switch (completedRole) {
-		case "planner": {
-			// Change 6: Planner done → advance to plan-review phase, NOT implementing.
-			// Wait for human approval before spawning the coder.
-			state.phase = "plan-review";
-			saveOrchestratorState(pi, state);
-			updateOrchestratorStatus(ctx, state);
-
-			// Update phase.json
-			const phaseFile = workflowPhasePath(ctx.cwd, state.task);
-			const phaseData = readPhase(phaseFile);
-			phaseData.phase = "plan-review";
-			phaseData.history.push({ phase: "plan-review", timestamp: Date.now(), by: "orchestrator" });
-			writePhase(phaseFile, phaseData);
-
-			await logEvent(ctx, "📋 Planner done. Plan ready for human review.", "info");
-			pi.sendUserMessage(
-				`📋 Plan is ready for review. Use /team approve ${state.task} to proceed or /team reject ${state.task} <feedback> to request changes.`
-			);
-			break;
-		}
-
-		case "coder": {
-			// Coder done → spawn or re-dispatch reviewer
-			state.phase = "reviewing";
-			state.reviewRound++;
-			saveOrchestratorState(pi, state);
-			updateOrchestratorStatus(ctx, state);
-
-			const reviewerSurfaceId = state.surfaceIds["reviewer"];
-			if (reviewerSurfaceId) {
-				// Re-use existing reviewer pane — just send dispatch to mailbox
-				await logEvent(ctx, `✅ Coder done. Re-dispatching reviewer (round ${state.reviewRound})...`, "success");
-				const reviewerMailbox = mailboxPath(ctx.cwd, state.task, "reviewer");
-				appendToMailbox(reviewerMailbox, {
-					type: "dispatch",
-					from: "orchestrator",
-					to: "reviewer",
-					task: `Review the implementation against .pi/workflow/${state.task}/plan.md. Read .pi/workflow/${state.task}/implementation.md for what was done.`,
-					timestamp: Date.now(),
-				});
-				ctx.ui.notify(`✅ Coder done. Re-dispatching reviewer (round ${state.reviewRound})...`, "info");
-			} else {
-				// No existing reviewer — spawn new pane
-				const agent = discovery.agents.find((a) => a.name === "reviewer");
-				if (!agent) {
-					ctx.ui.notify(`✅ Coder is done: ${summary}\n⚠️ No reviewer agent found. Spawn manually with /team spawn reviewer ${state.task}`, "info");
-					break;
-				}
-				await logEvent(ctx, `✅ Coder done. Spawning reviewer (round ${state.reviewRound})...`, "success");
-				const lastAgentSurface = state.surfaceIds["coder"] ?? state.surfaceIds["planner"];
-				const { surfaceId } = await spawnAgent(pi, ctx, agent, state.task,
-					`Review the implementation against .pi/workflow/${state.task}/plan.md. Read .pi/workflow/${state.task}/implementation.md for what was done.`,
-					lastAgentSurface ? "down" : "right",
-					lastAgentSurface ?? undefined);
-				if (!state.spawnedRoles.includes("reviewer")) state.spawnedRoles.push("reviewer");
-				if (surfaceId) state.surfaceIds["reviewer"] = surfaceId;
-
-				// Equalize all pane widths so each panel gets equal space
-				if (surfaceId) await cmuxEqualizeSplits();
-
-				// Dispatch task to reviewer's mailbox
-				const reviewerMailbox = mailboxPath(ctx.cwd, state.task, "reviewer");
-				appendToMailbox(reviewerMailbox, {
-					type: "dispatch",
-					from: "orchestrator",
-					to: "reviewer",
-					task: `Review the implementation against .pi/workflow/${state.task}/plan.md. Read .pi/workflow/${state.task}/implementation.md for what was done.`,
-					timestamp: Date.now(),
-				});
-			}
-			saveOrchestratorState(pi, state);
-			break;
-		}
-
-		case "reviewer": {
-			// Reviewer done → check if there are critical/important findings
-			// Read review.md to decide next step
-			const reviewPath = path.join(ctx.cwd, `.pi/workflow/${state.task}/review.md`);
-			let hasCriticalOrImportant = false;
-			try {
-				const reviewContent = fs.readFileSync(reviewPath, "utf-8");
-				// Check for unchecked critical or important items
-				hasCriticalOrImportant = /^### (Critical|Important).*\n(?:- \[ \])/m.test(reviewContent);
-			} catch {
-				// If we can't read the review, assume findings exist
-				hasCriticalOrImportant = true;
-			}
-
-			if (hasCriticalOrImportant && state.reviewRound < 3) {
-				// Re-dispatch coder to fix review findings
-				const agent = discovery.agents.find((a) => a.name === "coder");
-				if (!agent) {
-					pi.sendUserMessage(`✅ Reviewer done with findings. ⚠️ No coder agent found to fix them.`);
-					break;
-				}
-				state.phase = "fixing";
-				saveOrchestratorState(pi, state);
-				updateOrchestratorStatus(ctx, state);
-				// Re-use existing coder pane if available, otherwise spawn new
-				const coderSurfaceId = state.surfaceIds["coder"];
-				if (coderSurfaceId) {
-					await logEvent(ctx, "✅ Reviewer done with findings. Re-dispatching coder to fix them...", "warning");
-					// Send message to existing coder's mailbox
-					const coderMailbox = mailboxPath(ctx.cwd, state.task, "coder");
-					appendToMailbox(coderMailbox, {
-						type: "dispatch",
-						from: "orchestrator",
-						to: "coder",
-						task: `Address the review findings in .pi/workflow/${state.task}/review.md. Fix all Critical and Important items.`,
-						timestamp: Date.now(),
-					});
-					ctx.ui.notify("✅ Reviewer done with findings. Re-dispatching coder to fix them...", "info");
-				} else {
-					await logEvent(ctx, "✅ Reviewer done with findings. Spawning coder to fix them...", "warning");
-					ctx.ui.notify("✅ Reviewer done with findings. Spawning coder to fix them...", "info");
-					const { surfaceId: newCoderSurfaceId } = await spawnAgent(pi, ctx, agent, state.task,
-						`Address the review findings in .pi/workflow/${state.task}/review.md. Fix all Critical and Important items.`);
-					if (!state.spawnedRoles.includes("coder")) state.spawnedRoles.push("coder");
-					if (newCoderSurfaceId) state.surfaceIds["coder"] = newCoderSurfaceId;
-
-					// Equalize all pane widths so each panel gets equal space
-					if (newCoderSurfaceId) await cmuxEqualizeSplits();
-
-					// Dispatch task to coder's mailbox
-					const coderMailbox = mailboxPath(ctx.cwd, state.task, "coder");
-					appendToMailbox(coderMailbox, {
-						type: "dispatch",
-						from: "orchestrator",
-						to: "coder",
-						task: `Address the review findings in .pi/workflow/${state.task}/review.md. Fix all Critical and Important items.`,
-						timestamp: Date.now(),
-					});
-				}
-				saveOrchestratorState(pi, state);
-			} else {
-				// No critical findings, or max review rounds reached → final review by planner
-				state.phase = "final-review";
-				saveOrchestratorState(pi, state);
-				updateOrchestratorStatus(ctx, state);
-				await logEvent(ctx, "✅ Reviewer done. No critical findings remaining.", "success");
-				pi.sendUserMessage(`✅ Reviewer done. No critical findings remaining (round ${state.reviewRound}).\nReady for final review. Use /team send planner ${state.task} "Do a final review" or /team shutdown ${state.task} to close.`);
-			}
-			break;
-		}
-
-		default:
-			pi.sendUserMessage(`✅ ${completedRole} is done: ${summary}`);
-	}
-}
-
-// ─── Status update helpers ──────────────────────────────────────────────────
-
-function updateOrchestratorStatus(ctx: ExtensionContext, state: TeamState): void {
-	const phaseIcons: Record<string, string> = {
-		"planning": "📋",
-		"plan-review": "👀",
-		"implementing": "🔨",
-		"reviewing": "🔍",
-		"fixing": "🔧",
-		"final-review": "🔎",
-		"done": "✅",
-	};
-	const icon = phaseIcons[state.phase] ?? "📋";
-	ctx.ui.setStatus("team-phase", ctx.ui.theme.fg("accent", `${icon} ${state.phase}`));
-}
-
-async function logEvent(ctx: ExtensionContext, message: string, level: string = "info"): Promise<void> {
+async function cmuxLog(level: string, message: string): Promise<void> {
 	try {
 		await cmuxExec("log", "--level", level, "--source", "team", "--", message);
 	} catch {
@@ -573,9 +263,219 @@ async function logEvent(ctx: ExtensionContext, message: string, level: string = 
 	}
 }
 
-// ─── Mailbox message processing ─────────────────────────────────────────────
+// ─── Notification helper ─────────────────────────────────────────────────────
 
-function processMailboxMessages(
+function terminalNotify(title: string, body: string): void {
+	if (process.env.KITTY_WINDOW_ID) {
+		process.stdout.write(`\x1b]99;i=1:d=0;${title}\x1b\\`);
+		process.stdout.write(`\x1b]99;i=1:p=body;${body}\x1b\\`);
+	} else {
+		process.stdout.write(`\x1b]777;notify;${title};${body}\x07`);
+	}
+}
+
+// ─── Orchestrator context builder ────────────────────────────────────────────
+
+function statusIcon(status: string): string {
+	switch (status) {
+		case "done": return "✅";
+		case "working": return "🟡";
+		case "idle": return "🔵";
+		default: return "⚪";
+	}
+}
+
+function buildOrchestratorContext(state: TeamState, triggerReason: string, extraInfo?: string): string {
+	const lines: string[] = [];
+
+	lines.push(`📋 **Team Orchestration — ${state.task}**`);
+	lines.push("");
+	lines.push(`**Task:** ${state.taskDescription}`);
+	lines.push("");
+
+	// Agent roster
+	lines.push("**Agents:**");
+	for (const agent of state.agents) {
+		const status = state.agentStatus[agent.name] ?? "idle";
+		const icon = statusIcon(status);
+		// Show summary for done agents
+		const lastReport = getLastReportSummary(agent.name, state);
+		const statusDetail = status === "done" && lastReport ? ` — "${lastReport}"` : "";
+		lines.push(`  ${icon} ${agent.name} (${status})${statusDetail} — ${agent.description}`);
+	}
+	lines.push("");
+
+	// Extra info (e.g., challenge details)
+	if (extraInfo) {
+		lines.push(extraInfo);
+		lines.push("");
+	}
+
+	// Dispatch budget
+	const remaining = state.maxDispatches - state.dispatchCount;
+	lines.push(`**Dispatches:** ${state.dispatchCount}/${state.maxDispatches} used (${remaining} remaining)`);
+	lines.push("");
+
+	// Trigger reason
+	lines.push(`**Reason:** ${triggerReason}`);
+	lines.push("");
+
+	if (state.isComplete) {
+		lines.push("The task is marked as complete. No further action needed.");
+	} else if (remaining <= 0) {
+		lines.push("⚠️ No dispatches remaining. Use /team send to provide more budget or /team shutdown to end.");
+	} else {
+		lines.push("Use the `team_orchestrate` tool to dispatch an agent, or mark the task complete.");
+	}
+
+	return lines.join("\n");
+}
+
+function getLastReportSummary(agentName: string, state: TeamState): string | null {
+	// Find the last dispatch entry for this agent that has a result
+	for (let i = state.dispatchHistory.length - 1; i >= 0; i--) {
+		if (state.dispatchHistory[i].agent === agentName && state.dispatchHistory[i].result) {
+			return state.dispatchHistory[i].result!;
+		}
+	}
+	return null;
+}
+
+// ─── Orchestrator trigger ────────────────────────────────────────────────────
+
+function triggerOrchestration(
+	pi: ExtensionAPI,
+	ctx: ExtensionContext,
+	state: TeamState,
+	reason: string,
+	extraInfo?: string,
+): void {
+	if (state.isComplete) return;
+
+	const context = buildOrchestratorContext(state, reason, extraInfo);
+	pi.sendUserMessage(context, { deliverAs: "followUp" });
+}
+
+// ─── Agent spawn ─────────────────────────────────────────────────────────────
+
+async function spawnAgent(
+	pi: ExtensionAPI,
+	ctx: ExtensionContext,
+	agent: AgentRosterEntry,
+	task: string,
+	instructions: string,
+	splitDirection?: string,
+	splitFromSurfaceId?: string,
+): Promise<{ surfaceId: string | null }> {
+	// Generate context temp file
+	const tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-team-"));
+	const contextFile = path.join(tmpDir, `context-${agent.name}.md`);
+	const contextContent = [
+		`You are the **${agent.name}** agent for task **${task}**.`,
+		``,
+		`Workflow directory: \`.pi/workflow/${task}/\``,
+		`Write your report to: \`.pi/workflow/${task}/reports/${agent.name}.md\``,
+		`Your mailbox: \`.pi/workflow/${task}/mailbox/${agent.name}.json\``,
+		`Task description: \`.pi/workflow/${task}/task.md\``,
+		`Other agents' reports: \`.pi/workflow/${task}/reports/\``,
+		``,
+		`When you complete your work, call the \`team_report\` tool with a summary.`,
+		`If you need to challenge instructions or notify the orchestrator, use the \`team_message\` tool.`,
+		`All messages you send go to the orchestrator, who decides the next steps.`,
+	].join("\n");
+	await fs.promises.writeFile(contextFile, contextContent, { encoding: "utf-8", mode: 0o600 });
+
+	// Build the pi command
+	const args: string[] = [];
+	if (agent.model) args.push("--model", agent.model);
+	if (agent.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
+	if (agent.thinking) args.push("--thinking", agent.thinking);
+	args.push("--append-system-prompt", agent.filePath);
+	args.push("--append-system-prompt", contextFile);
+
+	// Set env vars for team identity
+	const envPrefix = `PI_TEAM_TASK=${task} PI_TEAM_ROLE=${agent.name}`;
+
+	// Try cmux split
+	let surfaceId: string | null = null;
+	try {
+		surfaceId = await cmuxSplitPane(splitDirection ?? "right", splitFromSurfaceId);
+	} catch {
+		// cmux not available
+	}
+
+	if (surfaceId) {
+		await new Promise((resolve) => setTimeout(resolve, 500));
+		const command = `${envPrefix} pi ${args.join(" ")}\n`;
+		await cmuxSendToSurface(surfaceId, command);
+
+		// Rename tab
+		const tabTitle = `⚪ ${agent.name}: ${task}`;
+		await cmuxRenameTab(surfaceId, tabTitle);
+	} else {
+		// No cmux — print manual command
+		const command = `${envPrefix} pi ${args.join(" ")}`;
+		ctx.ui.notify(`cmux not available. Run manually:\n${command}`, "info");
+	}
+
+	return { surfaceId };
+}
+
+// ─── Mailbox watching ────────────────────────────────────────────────────────
+
+function processOrchestratorMailbox(
+	pi: ExtensionAPI,
+	ctx: ExtensionContext,
+	task: string,
+	messages: TeamMessage[],
+): void {
+	const state = loadState(ctx.cwd, task);
+	if (!state) return;
+
+	// Process each message and build combined context
+	const parts: string[] = [];
+	let hasActionableMessage = false;
+
+	for (const msg of messages) {
+		if (msg.type === "done") {
+			hasActionableMessage = true;
+			// Update dispatch history with result
+			for (let i = state.dispatchHistory.length - 1; i >= 0; i--) {
+				if (state.dispatchHistory[i].agent === msg.from && !state.dispatchHistory[i].result) {
+					state.dispatchHistory[i].result = msg.summary ?? "";
+					break;
+				}
+			}
+			// Update agent status
+			state.agentStatus[msg.from] = "done";
+			saveState(ctx.cwd, state);
+
+			parts.push(`**Agent "${msg.from}" completed:** ${msg.summary ?? "No summary provided"}`);
+			if (msg.questions && msg.questions.length > 0) {
+				parts.push(`**Questions from ${msg.from}:**`);
+				for (const q of msg.questions) {
+					parts.push(`  - ${q}`);
+				}
+			}
+		} else if (msg.type === "challenge") {
+			hasActionableMessage = true;
+			parts.push(`**⚠️ Challenge from "${msg.from}":** ${msg.body ?? ""}`);
+		} else if (msg.type === "notify") {
+			// Notifies don't always need to trigger a turn, but include them
+			parts.push(`**📢 ${msg.from} notifies:** ${msg.body ?? ""}`);
+			hasActionableMessage = true; // Still trigger so orchestrator is aware
+		} else if (msg.type === "ack") {
+			parts.push(`**✅ ${msg.from} acknowledged:** ${msg.body ?? ""}`);
+		}
+	}
+
+	if (hasActionableMessage) {
+		const extraInfo = parts.join("\n\n");
+		triggerOrchestration(pi, ctx, state, "Agent update", extraInfo);
+	}
+}
+
+function processWorkerMailbox(
 	pi: ExtensionAPI,
 	ctx: ExtensionContext,
 	task: string,
@@ -584,26 +484,16 @@ function processMailboxMessages(
 ): void {
 	for (const msg of messages) {
 		if (msg.type === "dispatch") {
-			pi.sendUserMessage(msg.task ?? msg.body ?? "New task from orchestrator", { deliverAs: "followUp" });
-		} else if (msg.type === "challenge") {
-			pi.sendUserMessage(`⚠️ Challenge from ${msg.from}: ${msg.body}`, { deliverAs: "followUp" });
-		} else if (msg.type === "done") {
-			if (role === "orchestrator") {
-				handleRoleDone(pi, ctx, msg.from, msg.summary ?? "");
-			} else {
-				pi.sendUserMessage(`✅ ${msg.from} is done: ${msg.summary}`, { deliverAs: "followUp" });
-			}
+			pi.sendUserMessage(msg.instructions ?? msg.body ?? "New task from orchestrator", { deliverAs: "followUp" });
+		} else if (msg.type === "shutdown") {
+			ctx.ui.notify("🛑 Shutdown requested by orchestrator. Wrapping up.", "info");
 		} else if (msg.type === "notify") {
 			ctx.ui.notify(`📢 ${msg.from}: ${msg.body}`, "info");
 		} else if (msg.type === "ack") {
 			pi.sendUserMessage(`✅ ${msg.from} acknowledged: ${msg.body}`, { deliverAs: "followUp" });
-		} else if (msg.type === "shutdown") {
-			ctx.ui.notify("🛑 Shutdown requested by orchestrator. Wrapping up.", "info");
 		}
 	}
 }
-
-// ─── Mailbox watching ────────────────────────────────────────────────────────
 
 function setupMailboxWatching(
 	pi: ExtensionAPI,
@@ -621,12 +511,16 @@ function setupMailboxWatching(
 
 	let lastSize = fs.statSync(mp).size;
 
-	// Check for existing messages (e.g., dispatch written before fs.watch was set up)
+	// Check for existing messages (dispatch written before watcher was set up)
 	const existingMessages = readMailbox(mp);
 	if (existingMessages.length > 0) {
-		processMailboxMessages(pi, ctx, task, role, existingMessages);
+		if (role === "orchestrator") {
+			processOrchestratorMailbox(pi, ctx, task, existingMessages);
+		} else {
+			processWorkerMailbox(pi, ctx, task, role, existingMessages);
+		}
 		clearMailbox(mp);
-		lastSize = 0; // Reset since we cleared the mailbox
+		lastSize = 0;
 	}
 
 	try {
@@ -639,103 +533,21 @@ function setupMailboxWatching(
 				const messages = readMailbox(mp);
 				if (messages.length === 0) return;
 
-				processMailboxMessages(pi, ctx, task, role, messages);
+				if (role === "orchestrator") {
+					processOrchestratorMailbox(pi, ctx, task, messages);
+				} else {
+					processWorkerMailbox(pi, ctx, task, role, messages);
+				}
 				clearMailbox(mp);
 			} catch {
 				// Mailbox file might be temporarily unavailable
 			}
 		});
 
-		// Clean up watcher on process exit
 		process.on("exit", () => watcher.close());
 	} catch {
 		// fs.watch may fail on some systems
 	}
-}
-
-// ─── Agent spawn ─────────────────────────────────────────────────────────────
-
-async function spawnAgent(
-	pi: ExtensionAPI,
-	ctx: ExtensionContext,
-	agent: AgentConfig,
-	task: string,
-	initialMessage?: string,
-	splitDirection?: string,
-	splitFromSurfaceId?: string,
-): Promise<{ surfaceId: string | null }> {
-	// No auto-dispatch — the new pi session starts idle and watches its mailbox.
-	// The orchestrator (or auto-orchestration logic) will send a dispatch
-	// when it's time for this role to begin work.
-
-	// Generate task context temp file
-	const tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-team-"));
-	const contextFile = path.join(tmpDir, `context-${agent.name}.md`);
-	const contextContent = [
-		`You are the **${agent.name}** for task **${task}**.`,
-		``,
-		`Workflow directory: \`.pi/workflow/${task}/\``,
-		`Write deliverables to: \`.pi/workflow/${task}/\``,
-		`Your mailbox: \`.pi/workflow/${task}/mailbox/${agent.name}.json\``,
-		``,
-		`Available deliverables to read:`,
-		`- \`.pi/workflow/${task}/plan.md\` (from planner)`,
-		`- \`.pi/workflow/${task}/review.md\` (from reviewer)`,
-		`- \`.pi/workflow/${task}/implementation.md\` (from coder)`,
-	].join("\n");
-	await fs.promises.writeFile(contextFile, contextContent, { encoding: "utf-8", mode: 0o600 });
-
-	// Build the pi command
-	const args: string[] = [];
-	if (agent.model) args.push("--model", agent.model);
-	if (agent.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
-	if (agent.thinking) args.push("--thinking", agent.thinking);
-	args.push("--append-system-prompt", agent.filePath);
-	args.push("--append-system-prompt", contextFile);
-
-	// Set env vars for team identity
-	const envPrefix = `PI_TEAM_TASK=${task} PI_TEAM_ROLE=${agent.name}`;
-
-	// Try cmux split — split from the specified surface or the current one
-	let surfaceId: string | null = null;
-	try {
-		const direction = splitDirection ?? "right";
-		if (splitFromSurfaceId) {
-			// Split from a specific surface (e.g., the last agent pane)
-			const { stdout } = await cmuxExec("new-split", direction, "--surface", splitFromSurfaceId);
-			const match = stdout.match(/surface:(\d+)/i);
-			surfaceId = match ? `surface:${match[1]}` : null;
-		} else {
-			surfaceId = await cmuxSplitPane(direction);
-		}
-	} catch {
-		// cmux not available
-	}
-
-	if (surfaceId) {
-		// Wait a moment for the new pane to be ready
-		await new Promise((resolve) => setTimeout(resolve, 500));
-
-		// Send the pi command to the new surface
-		// cmux send-surface interprets \n as Enter
-		const command = `${envPrefix} pi ${args.join(" ")}\n`;
-		await cmuxSendToSurface(surfaceId, command);
-
-		// Rename the tab
-		const icons: Record<string, string> = {
-			planner: "🔵",
-			coder: "🟢",
-			reviewer: "🟡",
-		};
-		const tabTitle = `${icons[agent.name] ?? "⚪"} ${agent.name}: ${task}`;
-		await cmuxRenameTab(surfaceId, tabTitle);
-	} else {
-		// No cmux — print the command for manual execution
-		const command = `${envPrefix} pi ${args.join(" ")}`;
-		ctx.ui.notify(`cmux not available. Run manually:\n${command}`, "info");
-	}
-
-	return { surfaceId };
 }
 
 // ─── Main extension ──────────────────────────────────────────────────────────
@@ -744,32 +556,357 @@ export default function teamExtension(pi: ExtensionAPI) {
 	let currentTeamState: TeamState | null = null;
 	let currentWorkerState: WorkerState | null = null;
 
-	// ─── Register the team_message tool ────────────────────────────────────
+	// ─── team_orchestrate tool (orchestrator only) ────────────────────────
 
 	pi.registerTool({
-		name: "team_message",
-		label: "Team Message",
-		description: "Send a message to another role in your team (challenge, notify, etc.)",
-		promptSnippet: "Send a message to a team member",
+		name: "team_orchestrate",
+		label: "Orchestrate Team",
+		description:
+			"Orchestrate the team by dispatching an agent with instructions or marking the task complete. " +
+			"Use this to decide which agent should work next based on the current state of the team. " +
+			"Only available when you are the orchestrator.",
+		promptSnippet: "Dispatch an agent or complete the team task",
+		promptGuidelines: [
+			"Always dispatch one agent at a time. Wait for the agent to report back before dispatching another.",
+			"When an agent reports completion, review their summary and decide the next step.",
+			"If an agent raises a challenge or question, address it before continuing.",
+			"Use 'complete' action only when the overall task is fully accomplished.",
+			"You have a limited number of dispatches — use them wisely.",
+			"Give each agent clear, specific instructions about what you need them to do.",
+			"When dispatching an agent, include relevant context from previous agents' reports in the instructions.",
+		],
 		parameters: Type.Object({
-			to: StringEnum(["planner", "coder", "reviewer", "orchestrator"] as const, {
-				description: "Role to send the message to",
+			action: StringEnum(["dispatch", "complete"] as const, {
+				description: "Action to take: 'dispatch' sends a task to an agent, 'complete' marks the overall task as done",
 			}),
-			type: StringEnum(["challenge", "notify", "ack"] as const, {
-				description: "Type of message: challenge (disagreement/concern), notify (informational), or ack (acknowledge receipt/action)",
-			}),
-			body: Type.String({ description: "Message content" }),
-			referenceTo: Type.Optional(Type.String({ description: "Role whose message you're acknowledging" })),
+			agent: Type.Optional(Type.String({
+				description: "Name of the agent to dispatch (required for 'dispatch' action)",
+			})),
+			instructions: Type.Optional(Type.String({
+				description: "Clear instructions for the agent (required for 'dispatch' action). Include relevant context from previous agents' work.",
+			})),
+			summary: Type.Optional(Type.String({
+				description: "Summary of what was accomplished overall (required for 'complete' action)",
+			})),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			const task = process.env.PI_TEAM_TASK ?? currentWorkerState?.task ?? currentTeamState?.task;
-			const role = process.env.PI_TEAM_ROLE ?? currentWorkerState?.role ?? currentTeamState?.role;
+			const envRole = process.env.PI_TEAM_ROLE;
+			const isOrchestrator = envRole === "orchestrator" || currentTeamState !== null;
+
+			if (!isOrchestrator) {
+				return {
+					content: [{ type: "text", text: "Only the orchestrator can use team_orchestrate." }],
+					isError: true,
+				};
+			}
+
+			const task = process.env.PI_TEAM_TASK ?? currentTeamState?.task;
+			if (!task) {
+				return {
+					content: [{ type: "text", text: "No active team task." }],
+					isError: true,
+				};
+			}
+
+			const state = loadState(ctx.cwd, task);
+			if (!state) {
+				return {
+					content: [{ type: "text", text: `No workflow state found for "${task}".` }],
+					isError: true,
+				};
+			}
+
+			if (state.isComplete) {
+				return {
+					content: [{ type: "text", text: "Task is already marked as complete." }],
+					isError: true,
+				};
+			}
+
+			if (params.action === "dispatch") {
+				// Validate agent
+				if (!params.agent) {
+					const available = state.agents
+						.filter((a) => state.agentStatus[a.name] !== "working")
+						.map((a) => a.name);
+					return {
+						content: [{ type: "text", text: `Must specify an agent. Available (not working): ${available.join(", ") || "none"}` }],
+						isError: true,
+					};
+				}
+
+				const rosterEntry = state.agents.find((a) => a.name === params.agent);
+				if (!rosterEntry) {
+					const available = state.agents.map((a) => a.name);
+					return {
+						content: [{ type: "text", text: `Unknown agent "${params.agent}". Available: ${available.join(", ")}` }],
+						isError: true,
+					};
+				}
+
+				if (state.agentStatus[params.agent] === "working") {
+					return {
+						content: [{ type: "text", text: `Agent "${params.agent}" is already working. Wait for them to report back.` }],
+						isError: true,
+					};
+				}
+
+				if (!params.instructions) {
+					return {
+						content: [{ type: "text", text: "Must provide instructions for the agent." }],
+						isError: true,
+					};
+				}
+
+				// Check dispatch budget
+				if (state.dispatchCount >= state.maxDispatches) {
+					return {
+						content: [{ type: "text", text: `Dispatch limit reached (${state.maxDispatches}). Use /team send to continue with a new budget.` }],
+						isError: true,
+					};
+				}
+
+				// Record dispatch
+				state.dispatchCount++;
+				state.agentStatus[params.agent] = "working";
+				state.dispatchHistory.push({
+					agent: params.agent,
+					instructions: params.instructions,
+					timestamp: Date.now(),
+				});
+
+				// Write dispatch to agent's mailbox BEFORE spawning (ensures it's there at startup)
+				const agentMailbox = mailboxPath(ctx.cwd, task, params.agent);
+				appendToMailbox(agentMailbox, {
+					type: "dispatch",
+					from: "orchestrator",
+					to: params.agent,
+					instructions: params.instructions,
+					timestamp: Date.now(),
+				});
+
+				// Spawn the agent if not already running, otherwise mailbox watcher will pick it up
+				const hasSurface = !!state.surfaceIds[params.agent];
+				if (!hasSurface) {
+					// Determine split direction: first agent goes right, subsequent go down
+					const existingSurfaces = Object.values(state.surfaceIds);
+					const isFirstAgent = existingSurfaces.length === 0;
+					const splitDir = isFirstAgent ? "right" : "down";
+					const lastSurface = existingSurfaces[existingSurfaces.length - 1];
+
+					const { surfaceId } = await spawnAgent(
+						pi, ctx, rosterEntry, task, params.instructions,
+						splitDir, isFirstAgent ? undefined : lastSurface,
+					);
+
+					if (surfaceId) {
+						state.surfaceIds[params.agent] = surfaceId;
+						await cmuxEqualizeSplits();
+					}
+				}
+				// If agent already has a surface, the mailbox watcher will deliver the dispatch
+
+				saveState(ctx.cwd, state);
+				currentTeamState = state;
+
+				const remaining = state.maxDispatches - state.dispatchCount;
+				return {
+					content: [{
+						type: "text",
+						text: `✅ Dispatched "${params.agent}" with instructions.\nDispatches: ${state.dispatchCount}/${state.maxDispatches} (${remaining} remaining)`,
+					}],
+				};
+			}
+
+			if (params.action === "complete") {
+				if (!params.summary) {
+					return {
+						content: [{ type: "text", text: "Must provide a summary when completing the task." }],
+						isError: true,
+					};
+				}
+
+				state.isComplete = true;
+				state.dispatchHistory.push({
+					agent: "orchestrator",
+					instructions: `Task completed: ${params.summary}`,
+					timestamp: Date.now(),
+					result: params.summary,
+				});
+
+				saveState(ctx.cwd, state);
+				currentTeamState = state;
+
+				// Notify all agents
+				for (const agent of state.agents) {
+					const mp = mailboxPath(ctx.cwd, task, agent.name);
+					appendToMailbox(mp, {
+						type: "shutdown",
+						from: "orchestrator",
+						to: agent.name,
+						body: `Task "${task}" is complete: ${params.summary}`,
+						timestamp: Date.now(),
+					});
+				}
+
+				ctx.ui.setStatus("team-phase", ctx.ui.theme.fg("accent", "✅ done"));
+
+				return {
+					content: [{
+						type: "text",
+						text: `✅ Task "${task}" marked as complete: ${params.summary}`,
+					}],
+				};
+			}
+
+			return {
+				content: [{ type: "text", text: `Unknown action: ${params.action}` }],
+				isError: true,
+			};
+		},
+	});
+
+	// ─── team_report tool (worker only) ───────────────────────────────────
+
+	pi.registerTool({
+		name: "team_report",
+		label: "Report Task Completion",
+		description:
+			"Report that you have completed your assigned work. Call this when you're done with the task " +
+			"given to you by the orchestrator. Your summary will be sent to the orchestrator who will " +
+			"decide the next step. You can also include questions for the orchestrator.",
+		promptSnippet: "Report task completion to orchestrator",
+		promptGuidelines: [
+			"Call this when you have finished the task given to you by the orchestrator.",
+			"Provide a clear, concise summary of what you accomplished.",
+			"Include questions if you need clarification or decisions from the orchestrator.",
+			"After calling this, wait for further instructions from the orchestrator.",
+		],
+		parameters: Type.Object({
+			summary: Type.String({
+				description: "Clear summary of what you accomplished",
+			}),
+			questions: Type.Optional(Type.Array(Type.String(), {
+				description: "Questions for the orchestrator (e.g., clarifications, decisions needed)",
+			})),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const task = process.env.PI_TEAM_TASK ?? currentWorkerState?.task;
+			const role = process.env.PI_TEAM_ROLE ?? currentWorkerState?.role;
 
 			if (!task || !role) {
 				return {
 					content: [{ type: "text", text: "Not in a team session. Use /team commands to set up." }],
 					isError: true,
 				};
+			}
+
+			// Write report file
+			const rp = reportPath(ctx.cwd, task, role);
+			fs.mkdirSync(path.dirname(rp), { recursive: true });
+			const reportContent = [
+				`# Report: ${role}`,
+				"",
+				`## Summary`,
+				params.summary,
+				"",
+				...(params.questions && params.questions.length > 0
+					? ["## Questions", ...params.questions.map((q) => `- ${q}`), ""]
+					: []),
+			].join("\n");
+			fs.writeFileSync(rp, reportContent, { encoding: "utf-8" });
+
+			// Update state
+			const state = loadState(ctx.cwd, task);
+			if (state) {
+				state.agentStatus[role] = "done";
+				// Update dispatch history result
+				for (let i = state.dispatchHistory.length - 1; i >= 0; i--) {
+					if (state.dispatchHistory[i].agent === role && !state.dispatchHistory[i].result) {
+						state.dispatchHistory[i].result = params.summary;
+						break;
+					}
+				}
+				saveState(ctx.cwd, state);
+			}
+
+			// Send done message to orchestrator mailbox
+			const orchestratorMailbox = mailboxPath(ctx.cwd, task, "orchestrator");
+			appendToMailbox(orchestratorMailbox, {
+				type: "done",
+				from: role,
+				to: "orchestrator",
+				summary: params.summary,
+				questions: params.questions,
+				timestamp: Date.now(),
+			});
+
+			// Notify
+			terminalNotify("Pi", `${role} done for ${task}`);
+			try {
+				await cmuxNotify("Pi", `${role} done for ${task}`);
+			} catch {
+				// cmux not available
+			}
+
+			return {
+				content: [{
+					type: "text",
+					text: "✅ Report submitted. Wait for further instructions from the orchestrator.",
+				}],
+			};
+		},
+	});
+
+	// ─── team_message tool (all roles) ────────────────────────────────────
+
+	pi.registerTool({
+		name: "team_message",
+		label: "Team Message",
+		description:
+			"Send a message to the orchestrator (for workers) or to an agent (for orchestrator). " +
+			"Use 'challenge' to raise a concern or disagreement, 'notify' for informational updates, " +
+			"or 'ack' to acknowledge receipt of a message.",
+		promptSnippet: "Send a message to the orchestrator",
+		parameters: Type.Object({
+			to: Type.String({
+				description: "Recipient name (workers: use 'orchestrator'; orchestrator: use an agent name from your team)",
+			}),
+			type: StringEnum(["challenge", "notify", "ack"] as const, {
+				description: "Type of message: challenge (disagreement/concern), notify (informational), or ack (acknowledge receipt/action)",
+			}),
+			body: Type.String({ description: "Message content" }),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const task = process.env.PI_TEAM_TASK ?? currentWorkerState?.task ?? currentTeamState?.task;
+			const role = process.env.PI_TEAM_ROLE ?? currentWorkerState?.role ?? "orchestrator";
+
+			if (!task || !role) {
+				return {
+					content: [{ type: "text", text: "Not in a team session." }],
+					isError: true,
+				};
+			}
+
+			// Validate recipient
+			const state = loadState(ctx.cwd, task);
+			if (state) {
+				if (role !== "orchestrator" && params.to !== "orchestrator") {
+					return {
+						content: [{ type: "text", text: "Workers can only send messages to the orchestrator. Set 'to' to 'orchestrator'." }],
+						isError: true,
+					};
+				}
+
+				if (role === "orchestrator") {
+					const agentExists = state.agents.some((a) => a.name === params.to);
+					if (!agentExists) {
+						return {
+							content: [{ type: "text", text: `Unknown agent "${params.to}". Available: ${state.agents.map((a) => a.name).join(", ")}` }],
+							isError: true,
+						};
+					}
+				}
 			}
 
 			const mp = mailboxPath(ctx.cwd, task, params.to);
@@ -779,7 +916,6 @@ export default function teamExtension(pi: ExtensionAPI) {
 				to: params.to,
 				body: params.body,
 				timestamp: Date.now(),
-				referenceId: params.referenceTo,
 			});
 
 			return {
@@ -788,90 +924,20 @@ export default function teamExtension(pi: ExtensionAPI) {
 		},
 	});
 
-	// ─── Register the team_advance_phase tool (Change 5: includes "plan-review") ──
-
-	pi.registerTool({
-		name: "team_advance_phase",
-		label: "Advance Workflow Phase",
-		description: "Advance the team workflow to the next phase. Call when your deliverable is complete.",
-		promptSnippet: "Advance workflow to next phase after completing deliverable",
-		parameters: Type.Object({
-			nextPhase: StringEnum(["plan-review", "implementing", "reviewing", "fixing", "final-review", "done"] as const, {
-				description: "The next workflow phase to advance to",
-			}),
-			summary: Type.String({ description: "Brief summary of what was accomplished" }),
-		}),
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			const task = process.env.PI_TEAM_TASK ?? currentWorkerState?.task ?? currentTeamState?.task;
-			const role = process.env.PI_TEAM_ROLE ?? currentWorkerState?.role ?? currentTeamState?.role;
-
-			if (!task || !role) {
-				return {
-					content: [{ type: "text", text: "Not in a team session." }],
-					isError: true,
-				};
-			}
-
-			const phaseFile = workflowPhasePath(ctx.cwd, task);
-			const phaseData = readPhase(phaseFile);
-			const currentIdx = PHASES.indexOf(phaseData.phase);
-			const nextIdx = PHASES.indexOf(params.nextPhase);
-
-			if (nextIdx <= currentIdx) {
-				return {
-					content: [{ type: "text", text: `Cannot go backwards from ${phaseData.phase} to ${params.nextPhase}.` }],
-					isError: true,
-				};
-			}
-			if (nextIdx > currentIdx + 1 && params.nextPhase !== "done") {
-				return {
-					content: [{ type: "text", text: `Cannot skip from ${phaseData.phase} to ${params.nextPhase}. Next phase is ${PHASES[currentIdx + 1]}.` }],
-					isError: true,
-				};
-			}
-
-			const prevPhase = phaseData.phase;
-			phaseData.phase = params.nextPhase;
-			phaseData.history.push({ phase: params.nextPhase, timestamp: Date.now(), by: role });
-			if (params.nextPhase === "fixing") phaseData.reviewCycles++;
-			writePhase(phaseFile, phaseData);
-
-			// Notify all roles via their mailboxes
-			const roles = ["orchestrator", "planner", "coder", "reviewer"];
-			for (const r of roles) {
-				const mp = mailboxPath(ctx.cwd, task, r);
-				appendToMailbox(mp, {
-					type: "notify",
-					from: role,
-					to: r,
-					body: `Workflow advanced to **${params.nextPhase}** by ${role}. ${params.summary}`,
-					timestamp: Date.now(),
-				});
-			}
-
-			return {
-				content: [{ type: "text", text: `✅ Phase advanced: ${prevPhase} → ${params.nextPhase}` }],
-			};
-		},
-	});
-
-	// ─── questionnaire tool already exists as a built-in pi tool ───────────
-	// Change 4: The planner references the built-in questionnaire tool in its prompt.
-	// No need to re-register it here — it's available natively to all agents.
-
-	// ─── Register the team_read_deliverables tool ──────────────────────────
+	// ─── team_read_deliverables tool ──────────────────────────────────────
 
 	pi.registerTool({
 		name: "team_read_deliverables",
 		label: "Read Team Deliverables",
-		description: "Read all available workflow deliverables (plan, review, implementation). Use at the start of your work to get context from other roles.",
-		promptSnippet: "Read deliverables from other team roles",
+		description:
+			"Read the task description and all agent reports. Use at the start of your work to get " +
+			"context from previous agents, or when the orchestrator asks you to review what's been done.",
+		promptSnippet: "Read task description and agent reports",
 		parameters: Type.Object({}),
 		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
 			const task = process.env.PI_TEAM_TASK ?? currentWorkerState?.task ?? currentTeamState?.task;
-			const role = process.env.PI_TEAM_ROLE ?? currentWorkerState?.role ?? currentTeamState?.role;
 
-			if (!task || !role) {
+			if (!task) {
 				return {
 					content: [{ type: "text", text: "Not in a team session." }],
 					isError: true,
@@ -879,111 +945,100 @@ export default function teamExtension(pi: ExtensionAPI) {
 			}
 
 			const dir = workflowDir(ctx.cwd, task);
-			const deliverables = [
-				{ name: "plan.md", from: "planner", desc: "Implementation plan" },
-				{ name: "implementation.md", from: "coder", desc: "Implementation details" },
-				{ name: "review.md", from: "reviewer", desc: "Review findings" },
-			];
-
 			const parts: string[] = [];
-			for (const d of deliverables) {
-				const filePath = path.join(dir, d.name);
-				if (fs.existsSync(filePath)) {
-					const content = fs.readFileSync(filePath, "utf-8");
-					parts.push(`## ${d.name} (from ${d.from} — ${d.desc})\n\n${content}`);
+
+			// Read task description
+			const tfp = taskFilePath(ctx.cwd, task);
+			if (fs.existsSync(tfp)) {
+				const content = fs.readFileSync(tfp, "utf-8");
+				parts.push(`## Task Description\n\n${content}`);
+			}
+
+			// Read all reports
+			const rdir = reportsDir(ctx.cwd, task);
+			if (fs.existsSync(rdir)) {
+				const reportFiles = fs.readdirSync(rdir).filter((f) => f.endsWith(".md"));
+				for (const rf of reportFiles) {
+					const content = fs.readFileSync(path.join(rdir, rf), "utf-8");
+					parts.push(`## ${rf}\n\n${content}`);
 				}
 			}
 
 			if (parts.length === 0) {
-				return { content: [{ type: "text", text: "No deliverables found yet." }] };
+				return { content: [{ type: "text", text: "No task description or reports found yet." }] };
 			}
 
 			return { content: [{ type: "text", text: parts.join("\n\n---\n\n") }] };
 		},
 	});
 
-	// ─── Session start: restore state for subagents and orchestrators ──────
+	// ─── Session start: restore state ─────────────────────────────────────
 
 	pi.on("session_start", async (_event, ctx) => {
-		// Path 1: Subagent with env vars (set by spawn)
+		// Path 1: Worker with env vars (set by spawn)
 		const envTask = process.env.PI_TEAM_TASK;
 		const envRole = process.env.PI_TEAM_ROLE;
 
-		if (envTask && envRole) {
+		if (envTask && envRole && envRole !== "orchestrator") {
 			currentWorkerState = { task: envTask, role: envRole };
 			saveWorkerState(pi, currentWorkerState);
 			setupMailboxWatching(pi, ctx, envTask, envRole);
-
-			const icons: Record<string, string> = {
-				planner: "🔵",
-				coder: "🟢",
-				reviewer: "🟡",
-			};
-			pi.setSessionName(`${icons[envRole] ?? "⚪"} ${envRole}: ${envTask}`);
+			pi.setSessionName(`⚪ ${envRole}: ${envTask}`);
 			ctx.ui.notify(`Team session: ${envRole} for ${envTask}`, "info");
 			return;
 		}
 
 		// Path 2: Orchestrator resume from session state
-		const state = loadOrchestratorState(ctx);
-		if (state?.task && state?.role === "orchestrator") {
-			currentTeamState = state;
-			setupMailboxWatching(pi, ctx, state.task, "orchestrator");
-			pi.setSessionName(`🔷 Orchestrator: ${state.task}`);
+		const sessionTask = loadSessionTask(ctx);
+		if (sessionTask) {
+			const state = loadState(ctx.cwd, sessionTask);
+			if (state) {
+				currentTeamState = state;
+				setupMailboxWatching(pi, ctx, sessionTask, "orchestrator");
+				pi.setSessionName(`🔷 Orchestrator: ${sessionTask}`);
+
+				if (state.isComplete) {
+					ctx.ui.setStatus("team-phase", ctx.ui.theme.fg("accent", "✅ done"));
+				} else {
+					ctx.ui.setStatus("team-phase", ctx.ui.theme.fg("accent", `🔷 orchestrating (${state.dispatchCount}/${state.maxDispatches})`));
+				}
+			}
 		}
 	});
 
-	// ─── Agent end: auto-write done message ────────────────────────────────
+	// ─── Agent end: warn if agent didn't report ───────────────────────────
 
 	pi.on("agent_end", async (_event, ctx) => {
 		const task = process.env.PI_TEAM_TASK ?? currentWorkerState?.task;
 		const role = process.env.PI_TEAM_ROLE ?? currentWorkerState?.role;
 
-		if (!task || !role) return; // Not a team subagent
+		if (!task || !role || role === "orchestrator") return;
 
-		// Check for deliverable
-		const deliverable = DELIVERABLES[role];
-		let hasDeliverable = false;
-		if (deliverable) {
-			hasDeliverable = fs.existsSync(path.join(workflowDir(ctx.cwd, task), deliverable));
-		}
+		// Check if the worker reported via team_report
+		const state = loadState(ctx.cwd, task);
+		if (state && state.agentStatus[role] === "working") {
+			// Worker ended without calling team_report — notify orchestrator
+			const orchestratorMailbox = mailboxPath(ctx.cwd, task, "orchestrator");
+			appendToMailbox(orchestratorMailbox, {
+				type: "notify",
+				from: role,
+				to: "orchestrator",
+				body: `Agent "${role}" ended without calling team_report. They may have encountered an issue. Consider re-dispatching with /team redo ${task} ${role}.`,
+				timestamp: Date.now(),
+			});
 
-		// Write done message to orchestrator mailbox
-		const mp = mailboxPath(ctx.cwd, task, "orchestrator");
-		appendToMailbox(mp, {
-			type: "done",
-			from: role,
-			to: "orchestrator",
-			summary: `${role} finished processing${hasDeliverable ? ` — ${deliverable} written` : " — no deliverable found"}`,
-			timestamp: Date.now(),
-		});
-
-		// Send notification
-		notify("Pi", `${role} done for ${task}`);
-		try {
-			await cmuxNotify("Pi", `${role} done for ${task}`);
-		} catch {
-			// cmux not available
+			// Mark as idle so they can be re-dispatched
+			state.agentStatus[role] = "idle";
+			saveState(ctx.cwd, state);
 		}
 	});
 
-	// ─── /team command ─────────────────────────────────────────────────────
+	// ─── /team command ────────────────────────────────────────────────────
 
 	pi.registerCommand("team", {
-		description: "Manage multi-role team workflow",
+		description: "Manage dynamic multi-agent team workflows",
 		getArgumentCompletions: (prefix: string) => {
-			const subcommands = [
-				"init",
-				"spawn",
-				"status",
-				"send",
-				"approve",
-				"reject",
-				"redo",
-				"shutdown",
-				"auto",
-				"history",
-			];
+			const subcommands = ["init", "send", "status", "redo", "shutdown", "list", "history"];
 			return subcommands
 				.filter((s) => s.startsWith(prefix))
 				.map((s) => ({ value: s, label: s }));
@@ -996,429 +1051,359 @@ export default function teamExtension(pi: ExtensionAPI) {
 				// ─── /team init ─────────────────────────────────────────
 				case "init": {
 					const taskName = parts[1];
+					const agentNames = parts.slice(2);
+
 					if (!taskName) {
-						ctx.ui.notify("Usage: /team init <task-name>", "warning");
+						ctx.ui.notify("Usage: /team init <task-name> <agent>...", "warning");
+						return;
+					}
+
+					if (agentNames.length === 0) {
+						ctx.ui.notify("Usage: /team init <task-name> <agent>...\nSpecify at least one agent. Use /team list to see available agents.", "warning");
+						return;
+					}
+
+					// Discover available agents
+					const discovery = discoverAgents(ctx.cwd, "both");
+					const roster: AgentRosterEntry[] = [];
+					const notFound: string[] = [];
+
+					for (const name of agentNames) {
+						const agent = discovery.agents.find((a) => a.name === name);
+						if (!agent) {
+							notFound.push(name);
+						} else {
+							roster.push(agentConfigToRosterEntry(agent));
+						}
+					}
+
+					if (notFound.length > 0) {
+						const available = discovery.agents.map((a) => a.name).join(", ") || "none";
+						ctx.ui.notify(`Unknown agent(s): ${notFound.join(", ")}\nAvailable agents: ${available}`, "error");
 						return;
 					}
 
 					// Create workflow directory structure
-					initWorkflow(ctx.cwd, taskName);
+					const dir = workflowDir(ctx.cwd, taskName);
+					const mdir = mailboxDir(ctx.cwd, taskName);
+					const rdir = reportsDir(ctx.cwd, taskName);
+					fs.mkdirSync(dir, { recursive: true });
+					fs.mkdirSync(mdir, { recursive: true });
+					fs.mkdirSync(rdir, { recursive: true });
 
-					// Set up orchestrator identity
+					// Initialize mailbox files
+					for (const agent of roster) {
+						const mp = path.join(mdir, `${agent.name}.json`);
+						if (!fs.existsSync(mp)) {
+							fs.writeFileSync(mp, "[]", { encoding: "utf-8" });
+						}
+					}
+					// Orchestrator mailbox
+					const omp = path.join(mdir, "orchestrator.json");
+					if (!fs.existsSync(omp)) {
+						fs.writeFileSync(omp, "[]", { encoding: "utf-8" });
+					}
+
+					// Initialize state
+					const agentStatus: Record<string, "idle" | "working" | "done"> = {};
+					for (const agent of roster) {
+						agentStatus[agent.name] = "idle";
+					}
+
 					currentTeamState = {
 						task: taskName,
 						role: "orchestrator",
-						spawnedRoles: [],
+						agents: roster,
+						agentStatus,
 						surfaceIds: {},
-						phase: "planning",
-						completedRoles: [],
-						reviewRound: 0,
-						autoOrchestrate: true,
+						taskDescription: "",
+						dispatchHistory: [],
+						isComplete: false,
+						dispatchCount: 0,
+						maxDispatches: MAX_DISPATCHES,
 					};
-					saveOrchestratorState(pi, currentTeamState);
+					saveState(ctx.cwd, currentTeamState);
+					saveSessionState(pi, currentTeamState);
 
 					// Start watching orchestrator mailbox
 					setupMailboxWatching(pi, ctx, taskName, "orchestrator");
 
 					// Name the session
 					pi.setSessionName(`🔷 Orchestrator: ${taskName}`);
+					ctx.ui.setStatus("team-phase", ctx.ui.theme.fg("accent", `🔷 orchestrating (0/${MAX_DISPATCHES})`));
 
-					ctx.ui.notify(`Team initialized for "${taskName}"`, "info");
-					updateOrchestratorStatus(ctx, currentTeamState);
-					await logEvent(ctx, `Team initialized for ${taskName}`, "info");
+					const agentList = roster.map((a) => `  🔵 ${a.name} — ${a.description}`).join("\n");
+					ctx.ui.notify(`Team initialized for "${taskName}"\nAgents:\n${agentList}\n\nUse /team send ${taskName} <task-details> to start.`, "info");
+					await cmuxLog("info", `Team initialized for ${taskName} with agents: ${roster.map((a) => a.name).join(", ")}`);
 					break;
 				}
 
-				// ─── /team spawn ────────────────────────────────────────
-				case "spawn": {
-					const roleName = parts[1];
-					const taskName = parts[2];
-
-					if (!roleName || !taskName) {
-						ctx.ui.notify("Usage: /team spawn <role> <task-name>", "warning");
-						return;
-					}
-
-					if (!currentTeamState && !loadOrchestratorState(ctx)) {
-						ctx.ui.notify("Not an orchestrator session. Run /team init first.", "warning");
-						return;
-					}
-
-					const state = currentTeamState ?? loadOrchestratorState(ctx)!;
-
-					// Discover available agents
-					const discovery = discoverAgents(ctx.cwd, "both");
-					const agent = discovery.agents.find((a) => a.name === roleName);
-
-					if (!agent) {
-						const available = discovery.agents.map((a) => a.name).join(", ") || "none";
-						ctx.ui.notify(`Unknown role "${roleName}". Available: ${available}`, "error");
-						return;
-					}
-
-					// Optional initial message from remaining args
-					const initialMessage = parts.length > 3 ? parts.slice(3).join(" ") : undefined;
-
-					// Spawn the agent — first agent splits right from orchestrator,
-					// subsequent agents split down from the last agent in the right column
-					const lastAgentSurface = state.surfaceIds["reviewer"] ?? state.surfaceIds["coder"] ?? state.surfaceIds["planner"];
-					const isFirstAgent = Object.keys(state.surfaceIds).length === 0;
-					const splitDir = isFirstAgent ? "right" : "down";
-					const splitFrom = isFirstAgent ? undefined : lastAgentSurface;
-
-					const { surfaceId } = await spawnAgent(pi, ctx, agent, taskName, initialMessage, splitDir, splitFrom);
-
-					// Update state
-					state.spawnedRoles.push(roleName);
-					if (surfaceId) state.surfaceIds[roleName] = surfaceId;
-
-					// Update phase based on which role was spawned
-					if (roleName === "planner") state.phase = "planning";
-					else if (roleName === "coder") state.phase = state.reviewRound > 0 ? "fixing" : "implementing";
-					else if (roleName === "reviewer") state.phase = "reviewing";
-
-					saveOrchestratorState(pi, state);
-
-					// Equalize all pane widths so each panel gets equal space
-					if (surfaceId) await cmuxEqualizeSplits();
-
-					// Dispatch task to the spawned role's mailbox
-					const dispatchMessage = initialMessage ?? getDefaultDispatchMessage(roleName, taskName);
-					const roleMailbox = mailboxPath(ctx.cwd, taskName, roleName);
-					appendToMailbox(roleMailbox, {
-						type: "dispatch",
-						from: "orchestrator",
-						to: roleName,
-						task: dispatchMessage,
-						timestamp: Date.now(),
-					});
-
-					ctx.ui.notify(`Spawned ${roleName} for "${taskName}"${surfaceId ? ` (pane: ${surfaceId})` : " (manual mode)"}`, "info");
-					updateOrchestratorStatus(ctx, state);
-					await logEvent(ctx, `Spawned ${roleName} for ${taskName}`, "info");
-					break;
-				}
-
-				// ─── /team approve (Change 3) ────────────────────────────
-				case "approve": {
+				// ─── /team send ─────────────────────────────────────────
+				case "send": {
 					const taskName = parts[1];
-					if (!taskName) {
-						ctx.ui.notify("Usage: /team approve <task-name>", "warning");
+					const taskDetails = parts.slice(2).join(" ");
+
+					if (!taskName || !taskDetails) {
+						ctx.ui.notify("Usage: /team send <task-name> <task-details>", "warning");
 						return;
 					}
 
-					const state = currentTeamState ?? loadOrchestratorState(ctx);
+					const state = currentTeamState ?? loadState(ctx.cwd, taskName);
 					if (!state) {
-						ctx.ui.notify("Not an orchestrator session. Run /team init first.", "warning");
+						ctx.ui.notify(`No workflow found for "${taskName}". Run /team init first.`, "warning");
 						return;
 					}
 
-					// Verify we're in plan-review phase
-					if (state.phase !== "plan-review") {
-						ctx.ui.notify(`Cannot approve: current phase is "${state.phase}", not "plan-review". Use /team status ${taskName} to check.`, "warning");
+					if (state.isComplete) {
+						ctx.ui.notify(`Task "${taskName}" is already complete.`, "warning");
 						return;
 					}
 
-					// Advance to implementing and spawn coder
-					await spawnCoder(pi, ctx, state);
-					currentTeamState = state; // Keep in-memory state in sync
-					ctx.ui.notify(`✅ Plan approved for "${taskName}". Spawning coder.`, "info");
-					await logEvent(ctx, `Plan approved for ${taskName}`, "info");
-					break;
-				}
+					// Update task description
+					state.taskDescription = taskDetails;
+					saveState(ctx.cwd, state);
+					currentTeamState = state;
 
-				// ─── /team reject (Change 3) ─────────────────────────────
-				case "reject": {
-					const taskName = parts[1];
-					const feedback = parts.slice(2).join(" ");
+					// Write task.md
+					const tfp = taskFilePath(ctx.cwd, taskName);
+					fs.writeFileSync(tfp, taskDetails, { encoding: "utf-8" });
 
-					if (!taskName) {
-						ctx.ui.notify("Usage: /team reject <task-name> <feedback>", "warning");
-						return;
-					}
-
-					if (!feedback) {
-						ctx.ui.notify("Please provide feedback when rejecting a plan. Usage: /team reject <task-name> <feedback>", "warning");
-						return;
-					}
-
-					const state = currentTeamState ?? loadOrchestratorState(ctx);
-					if (!state) {
-						ctx.ui.notify("Not an orchestrator session. Run /team init first.", "warning");
-						return;
-					}
-
-					// Verify we're in plan-review phase
-					if (state.phase !== "plan-review") {
-						ctx.ui.notify(`Cannot reject: current phase is "${state.phase}", not "plan-review". Use /team status ${taskName} to check.`, "warning");
-						return;
-					}
-
-					// Reset phase back to planning
-					state.phase = "planning";
-					saveOrchestratorState(pi, state);
-					currentTeamState = state; // Keep in-memory state in sync
-					updateOrchestratorStatus(ctx, state);
-
-					// Update phase.json
-					const phaseFile = workflowPhasePath(ctx.cwd, taskName);
-					const phaseData = readPhase(phaseFile);
-					phaseData.phase = "planning";
-					phaseData.history.push({ phase: "planning", timestamp: Date.now(), by: "orchestrator" });
-					writePhase(phaseFile, phaseData);
-
-					// Send feedback to planner's mailbox
-					const plannerMailbox = mailboxPath(ctx.cwd, taskName, "planner");
-					appendToMailbox(plannerMailbox, {
-						type: "dispatch",
-						from: "orchestrator",
-						to: "planner",
-						task: `Plan rejected. Feedback: ${feedback}. Please revise the plan and write an updated plan.md.`,
-						timestamp: Date.now(),
-					});
-
-					ctx.ui.notify(`❌ Plan rejected for "${taskName}". Run /team redo planner ${taskName} to re-dispatch the planner with your feedback.`, "info");
-					await logEvent(ctx, `Plan rejected for ${taskName}: ${feedback}`, "info");
-					break;
-				}
-
-				// ─── /team redo (Change 7) ───────────────────────────────
-				case "redo": {
-					const roleName = parts[1];
-					const taskName = parts[2];
-
-					if (!roleName || !taskName) {
-						ctx.ui.notify("Usage: /team redo <role> <task-name>", "warning");
-						return;
-					}
-
-					const validRoles = ["planner", "coder", "reviewer"];
-					if (!validRoles.includes(roleName)) {
-						ctx.ui.notify(`Unknown role "${roleName}". Valid roles: ${validRoles.join(", ")}`, "warning");
-						return;
-					}
-
-					const state = currentTeamState ?? loadOrchestratorState(ctx);
-					if (!state) {
-						ctx.ui.notify("Not an orchestrator session. Run /team init first.", "warning");
-						return;
-					}
-
-					// Validate that the role has been spawned before making any state changes
-					if (!state.spawnedRoles.includes(roleName)) {
-						ctx.ui.notify(`Role "${roleName}" has not been spawned yet. Use /team spawn ${roleName} ${taskName} first.`, "warning");
-						return;
-					}
-
-					// Warn if redoing reviewer while coder is actively fixing
-					if (roleName === "reviewer" && state.phase === "fixing") {
-						ctx.ui.notify(`⚠️ Coder is currently fixing review findings (phase: fixing). Redoing reviewer will reset phase to "reviewing" and may leave the coder in an inconsistent state. Proceed with caution.`, "warning");
-					}
-
-					// Reset phase based on the role
-					if (roleName === "planner") {
-						state.phase = "planning";
-					} else if (roleName === "coder") {
-						state.phase = "implementing";
-					} else if (roleName === "reviewer") {
-						state.phase = "reviewing";
-					}
-
-					// Remove from completedRoles
-					state.completedRoles = state.completedRoles.filter((r) => r !== roleName);
-					saveOrchestratorState(pi, state);
-					currentTeamState = state; // Keep in-memory state in sync
-					updateOrchestratorStatus(ctx, state);
-
-					// Update phase.json
-					const phaseFile = workflowPhasePath(ctx.cwd, taskName);
-					const phaseData = readPhase(phaseFile);
-					phaseData.phase = state.phase as WorkflowPhase;
-					phaseData.history.push({ phase: state.phase as WorkflowPhase, timestamp: Date.now(), by: "orchestrator" });
-					writePhase(phaseFile, phaseData);
-
-					// Clear stale mailbox messages before re-dispatch
-					const roleMailbox = mailboxPath(ctx.cwd, taskName, roleName);
-					clearMailbox(roleMailbox);
-
-					// Send redo dispatch to the role's mailbox
-					const redoMessage = getDefaultDispatchMessage(roleName, taskName);
-					appendToMailbox(roleMailbox, {
-						type: "dispatch",
-						from: "orchestrator",
-						to: roleName,
-						task: `Redo requested. ${redoMessage}`,
-						timestamp: Date.now(),
-					});
-
-					ctx.ui.notify(`🔁 Redo: ${roleName} re-dispatched for "${taskName}". Phase reset to ${state.phase}.`, "info");
-					await logEvent(ctx, `Redo: ${roleName} re-dispatched for ${taskName}`, "info");
+					// Trigger orchestration
+					triggerOrchestration(pi, ctx, state, "New task from user");
+					ctx.ui.notify(`Task sent to orchestrator for "${taskName}"`, "info");
+					await cmuxLog("info", `Task sent for ${taskName}: ${taskDetails.substring(0, 100)}...`);
 					break;
 				}
 
 				// ─── /team status ───────────────────────────────────────
 				case "status": {
-					const taskName = parts[1] ?? currentTeamState?.task ?? loadOrchestratorState(ctx)?.task;
+					const taskName = parts[1] ?? currentTeamState?.task ?? loadSessionTask(ctx);
 
 					if (!taskName) {
 						ctx.ui.notify("Usage: /team status <task-name>", "warning");
 						return;
 					}
 
-					const dir = workflowDir(ctx.cwd, taskName);
-					if (!fs.existsSync(dir)) {
+					const state = loadState(ctx.cwd, taskName);
+					if (!state) {
 						ctx.ui.notify(`No workflow found for "${taskName}"`, "warning");
 						return;
 					}
 
-					// Read all mailboxes
-					const roles = ["orchestrator", "planner", "coder", "reviewer"];
-					const statusLines: string[] = [`📋 Workflow: ${taskName}\n`];
+					const lines: string[] = [`📋 Workflow: ${taskName}`];
 
-					// Check deliverables
-					const deliverables = ["plan.md", "review.md", "implementation.md"];
-					statusLines.push("📄 Deliverables:");
-					for (const d of deliverables) {
-						const exists = fs.existsSync(path.join(dir, d));
-						statusLines.push(`  ${exists ? "✅" : "⬜"} ${d}`);
+					if (state.taskDescription) {
+						lines.push(`\n📝 Task: ${state.taskDescription}`);
 					}
 
-					// Check mailboxes
-					statusLines.push("\n📬 Mailboxes:");
-					for (const role of roles) {
-						const mp = mailboxPath(ctx.cwd, taskName, role);
-						const messages = readMailbox(mp);
-						const unread = messages.length;
-						statusLines.push(`  ${unread > 0 ? "🔴" : "🟢"} ${role}: ${unread} message${unread !== 1 ? "s" : ""}`);
+					lines.push("\n👥 Agents:");
+					for (const agent of state.agents) {
+						const status = state.agentStatus[agent.name] ?? "idle";
+						const icon = statusIcon(status);
+						const surface = state.surfaceIds[agent.name] ? ` (pane: ${state.surfaceIds[agent.name]})` : "";
+						const lastResult = getLastReportSummary(agent.name, state);
+						const resultLine = status === "done" && lastResult ? `\n     Last: ${lastResult.substring(0, 80)}${lastResult.length > 80 ? "..." : ""}` : "";
+						lines.push(`  ${icon} ${agent.name} — ${status}${surface}${resultLine}`);
 					}
 
-					// Show workflow state
-					const state = currentTeamState ?? loadOrchestratorState(ctx);
-					if (state) {
-						statusLines.push(`\n🔄 Phase: ${state.phase}`);
-						statusLines.push(`🤖 Auto-orchestrate: ${state.autoOrchestrate ? "ON" : "OFF"}`);
-						if (state.spawnedRoles?.length) {
-							statusLines.push(`👥 Spawned: ${state.spawnedRoles.join(", ")}`);
-						}
-						if (state.completedRoles?.length) {
-							statusLines.push(`✅ Completed: ${state.completedRoles.join(", ")}`);
-						}
-						if (state.reviewRound > 0) {
-							statusLines.push(`🔁 Review round: ${state.reviewRound}`);
+					// Reports
+					const rdir = reportsDir(ctx.cwd, taskName);
+					if (fs.existsSync(rdir)) {
+						const reportFiles = fs.readdirSync(rdir).filter((f) => f.endsWith(".md"));
+						if (reportFiles.length > 0) {
+							lines.push("\n📄 Reports:");
+							for (const rf of reportFiles) {
+								lines.push(`  ✅ ${rf}`);
+							}
 						}
 					}
 
-					// Show workflow phase from phase.json
-					const phaseFile = workflowPhasePath(ctx.cwd, taskName);
-					if (fs.existsSync(phaseFile)) {
-						const phaseData = readPhase(phaseFile);
-						statusLines.push(`\n🔄 Phase: **${phaseData.phase}**`);
-						if (phaseData.reviewCycles > 0) {
-							statusLines.push(`   Review cycles: ${phaseData.reviewCycles}`);
-						}
-						if (phaseData.history.length > 0) {
-							const last = phaseData.history[phaseData.history.length - 1];
-							statusLines.push(`   Last change: ${last.phase} by ${last.by}`);
+					// Mailboxes
+					const mdir = mailboxDir(ctx.cwd, taskName);
+					if (fs.existsSync(mdir)) {
+						lines.push("\n📬 Mailboxes:");
+						const mailboxFiles = fs.readdirSync(mdir).filter((f) => f.endsWith(".json"));
+						for (const mf of mailboxFiles) {
+							const mp = path.join(mdir, mf);
+							const messages = readMailbox(mp);
+							const unread = messages.length;
+							const name = mf.replace(".json", "");
+							lines.push(`  ${unread > 0 ? "🔴" : "🟢"} ${name}: ${unread} message${unread !== 1 ? "s" : ""}`);
 						}
 					}
 
-					ctx.ui.notify(statusLines.join("\n"), "info");
+					lines.push(`\n🔄 Complete: ${state.isComplete ? "Yes ✅" : "No"}`);
+					lines.push(`📊 Dispatches: ${state.dispatchCount}/${state.maxDispatches}`);
+
+					ctx.ui.notify(lines.join("\n"), "info");
 					break;
 				}
 
-				// ─── /team send ─────────────────────────────────────────
-				case "send": {
-					const roleName = parts[1];
-					const taskName = parts[2];
+				// ─── /team redo ─────────────────────────────────────────
+				case "redo": {
+					const taskName = parts[1];
+					const agentName = parts[2];
 					const message = parts.slice(3).join(" ");
 
-					if (!roleName || !taskName || !message) {
-						ctx.ui.notify("Usage: /team send <role> <task-name> <message>", "warning");
+					if (!taskName || !agentName) {
+						ctx.ui.notify("Usage: /team redo <task-name> <agent> [message]", "warning");
 						return;
 					}
 
-					const mp = mailboxPath(ctx.cwd, taskName, roleName);
-					appendToMailbox(mp, {
-						type: "dispatch",
-						from: "orchestrator",
-						to: roleName,
-						task: message,
+					const state = currentTeamState ?? loadState(ctx.cwd, taskName);
+					if (!state) {
+						ctx.ui.notify(`No workflow found for "${taskName}"`, "warning");
+						return;
+					}
+
+					const rosterEntry = state.agents.find((a) => a.name === agentName);
+					if (!rosterEntry) {
+						ctx.ui.notify(`Unknown agent "${agentName}". Available: ${state.agents.map((a) => a.name).join(", ")}`, "error");
+						return;
+					}
+
+					if (state.agentStatus[agentName] === "working") {
+						ctx.ui.notify(`Agent "${agentName}" is currently working. Wait for them to finish first.`, "warning");
+						return;
+					}
+
+					// Re-dispatch the agent
+					const instructions = message || `Re-do your previous task. Review your earlier report and improve on it.`;
+
+					state.agentStatus[agentName] = "working";
+					state.dispatchCount++;
+					state.dispatchHistory.push({
+						agent: agentName,
+						instructions,
 						timestamp: Date.now(),
 					});
 
-					ctx.ui.notify(`Message sent to ${roleName}`, "info");
+					// Write dispatch to mailbox
+					const agentMailbox = mailboxPath(ctx.cwd, taskName, agentName);
+					appendToMailbox(agentMailbox, {
+						type: "dispatch",
+						from: "orchestrator",
+						to: agentName,
+						instructions: instructions,
+						timestamp: Date.now(),
+					});
+
+					// Spawn if not already running
+					if (!state.surfaceIds[agentName]) {
+						const existingSurfaces = Object.values(state.surfaceIds);
+						const isFirstAgent = existingSurfaces.length === 0;
+						const splitDir = isFirstAgent ? "right" : "down";
+						const lastSurface = existingSurfaces[existingSurfaces.length - 1];
+
+						const { surfaceId } = await spawnAgent(
+							pi, ctx, rosterEntry, taskName, instructions,
+							splitDir, isFirstAgent ? undefined : lastSurface,
+						);
+
+						if (surfaceId) {
+							state.surfaceIds[agentName] = surfaceId;
+							await cmuxEqualizeSplits();
+						}
+					}
+
+					saveState(ctx.cwd, state);
+					currentTeamState = state;
+
+					ctx.ui.notify(`🔁 Re-dispatched "${agentName}" for "${taskName}"`, "info");
+					await cmuxLog("info", `Re-dispatched ${agentName} for ${taskName}`);
 					break;
 				}
 
 				// ─── /team shutdown ─────────────────────────────────────
 				case "shutdown": {
-					const taskName = parts[1] ?? currentTeamState?.task ?? loadOrchestratorState(ctx)?.task;
+					const taskName = parts[1] ?? currentTeamState?.task ?? loadSessionTask(ctx);
 
 					if (!taskName) {
 						ctx.ui.notify("Usage: /team shutdown <task-name>", "warning");
 						return;
 					}
 
-					const state = currentTeamState ?? loadOrchestratorState(ctx);
-					const roles = state?.spawnedRoles ?? ["planner", "coder", "reviewer"];
+					const state = currentTeamState ?? loadState(ctx.cwd, taskName);
 
-					// Send shutdown to all roles
-					for (const role of roles) {
-						const mp = mailboxPath(ctx.cwd, taskName, role);
-						appendToMailbox(mp, {
-							type: "shutdown",
-							from: "orchestrator",
-							to: role,
-							timestamp: Date.now(),
-						});
-					}
+					// Send shutdown to all agents
+					if (state) {
+						for (const agent of state.agents) {
+							const mp = mailboxPath(ctx.cwd, taskName, agent.name);
+							appendToMailbox(mp, {
+								type: "shutdown",
+								from: "orchestrator",
+								to: agent.name,
+								body: "Workflow shutdown requested.",
+								timestamp: Date.now(),
+							});
+						}
 
-					// Close cmux panes
-					if (state?.surfaceIds) {
-						for (const [role, surfaceId] of Object.entries(state.surfaceIds)) {
+						// Close cmux panes
+						for (const [agentName, surfaceId] of Object.entries(state.surfaceIds)) {
 							await cmuxCloseSurface(surfaceId);
 						}
+
+						state.isComplete = true;
+						saveState(ctx.cwd, state);
 					}
 
+					ctx.ui.setStatus("team-phase", undefined);
 					ctx.ui.notify(`Shutdown sent for "${taskName}"`, "info");
 					break;
 				}
 
-				// ─── /team auto ──────────────────────────────────────
-				case "auto": {
-					const state = currentTeamState ?? loadOrchestratorState(ctx);
-					if (!state) {
-						ctx.ui.notify("Not an orchestrator session. Run /team init first.", "warning");
+				// ─── /team list ─────────────────────────────────────────
+				case "list": {
+					const discovery = discoverAgents(ctx.cwd, "both");
+
+					if (discovery.agents.length === 0) {
+						ctx.ui.notify("No agents found.\n\nAdd agent .md files to:\n  ~/.pi/agent/team/ (user-level)\n  .pi/team/ (project-level)", "info");
 						return;
 					}
-					state.autoOrchestrate = !state.autoOrchestrate;
-					saveOrchestratorState(pi, state);
-					ctx.ui.notify(`Auto-orchestrate: ${state.autoOrchestrate ? "ON ✅" : "OFF ⏸️"}`, "info");
+
+					const lines: string[] = ["🤖 Available Agents:\n"];
+					for (const agent of discovery.agents) {
+						const source = agent.source === "user" ? "👤" : "📁";
+						const model = agent.model ? ` [${agent.model}]` : "";
+						const tools = agent.tools ? ` (tools: ${agent.tools.join(", ")})` : "";
+						lines.push(`  ${source} ${agent.name}${model}${tools}`);
+						lines.push(`     ${agent.description}`);
+					}
+
+					ctx.ui.notify(lines.join("\n"), "info");
 					break;
 				}
 
-				// ─── /team history ─────────────────────────────────────
+				// ─── /team history ──────────────────────────────────────
 				case "history": {
-					const taskName = parts[1] ?? currentTeamState?.task ?? loadOrchestratorState(ctx)?.task;
+					const taskName = parts[1] ?? currentTeamState?.task ?? loadSessionTask(ctx);
+
 					if (!taskName) {
 						ctx.ui.notify("Usage: /team history <task-name>", "warning");
 						return;
 					}
 
-					const phaseFile = workflowPhasePath(ctx.cwd, taskName);
-					if (!fs.existsSync(phaseFile)) {
-						ctx.ui.notify(`No phase history for "${taskName}"`, "warning");
+					const state = loadState(ctx.cwd, taskName);
+					if (!state) {
+						ctx.ui.notify(`No workflow found for "${taskName}"`, "warning");
 						return;
 					}
 
-					const phaseData = readPhase(phaseFile);
-					const lines: string[] = [`📜 Workflow History: ${taskName}\n`];
-					lines.push(`Current phase: ${phaseData.phase}`);
-					lines.push(`Review cycles: ${phaseData.reviewCycles}\n`);
-					lines.push("Transitions:");
-					for (const entry of phaseData.history) {
-						const time = new Date(entry.timestamp).toLocaleTimeString();
-						lines.push(`  ${time} — ${entry.phase} (by ${entry.by})`);
+					const lines: string[] = [`📜 Dispatch History: ${taskName}\n`];
+
+					if (state.dispatchHistory.length === 0) {
+						lines.push("No dispatches yet.");
+					} else {
+						for (let i = 0; i < state.dispatchHistory.length; i++) {
+							const entry = state.dispatchHistory[i];
+							const time = new Date(entry.timestamp).toLocaleTimeString();
+							const resultIcon = entry.result ? "✅" : "🟡";
+							lines.push(`${i + 1}. ${resultIcon} ${entry.agent} — ${time}`);
+							lines.push(`   Instructions: ${entry.instructions.substring(0, 100)}${entry.instructions.length > 100 ? "..." : ""}`);
+							if (entry.result) {
+								lines.push(`   Result: ${entry.result.substring(0, 100)}${entry.result.length > 100 ? "..." : ""}`);
+							}
+						}
 					}
 
 					ctx.ui.notify(lines.join("\n"), "info");
@@ -1428,16 +1413,13 @@ export default function teamExtension(pi: ExtensionAPI) {
 				default: {
 					ctx.ui.notify(
 						"Unknown command. Usage:\n" +
-							"  /team init <task-name>\n" +
-							"  /team spawn <role> <task-name>\n" +
+							"  /team init <task-name> <agent>...\n" +
+							"  /team send <task-name> <task-details>\n" +
 							"  /team status [task-name]\n" +
-							"  /team send <role> <task-name> <message>\n" +
-							"  /team approve <task-name>\n" +
-							"  /team reject <task-name> <feedback>\n" +
-							"  /team redo <role> <task-name>\n" +
-							"  /team history [task-name]\n" +
-							"  /team auto\n" +
-							"  /team shutdown [task-name]",
+							"  /team redo <task-name> <agent> [message]\n" +
+							"  /team shutdown [task-name]\n" +
+							"  /team list\n" +
+							"  /team history [task-name]",
 						"info",
 					);
 				}
