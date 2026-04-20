@@ -10,9 +10,11 @@
  *
  * Commands:
  *   /team init <task> <agent>...     — Create team, become orchestrator
- *   /team send <task> <details>      — Send task to orchestrator, starts orchestration
+ *   /team send [task] <details>      — Send task to orchestrator (task name optional if active)
  *   /team status [task]              — Show workflow state
  *   /team redo <task> <agent> [msg]  — Re-dispatch an agent (manual override)
+ *   /team detach                     — Disable auto-routing of chat to team
+ *   /team attach                     — Re-enable auto-routing of chat to team
  *   /team shutdown [task]            — Graceful shutdown of all workers
  *   /team list                       — List available agents
  *   /team history [task]             — Show dispatch history
@@ -73,6 +75,7 @@ interface TeamState {
 	isComplete: boolean;
 	dispatchCount: number;
 	maxDispatches: number;
+	_autoRoute: boolean;
 	pendingTrigger: string | null;
 	pendingTriggerExtra: string | null;
 }
@@ -135,7 +138,12 @@ function loadState(cwd: string, task: string): TeamState | null {
 	try {
 		const content = fs.readFileSync(sp, "utf-8").trim();
 		if (!content) return null;
-		return JSON.parse(content);
+		const state = JSON.parse(content);
+		// Backward compat: default _autoRoute to true for state files that predate the field
+		if (state._autoRoute === undefined) {
+			state._autoRoute = true;
+		}
+		return state;
 	} catch {
 		return null;
 	}
@@ -195,10 +203,11 @@ function appendToMailbox(filePath: string, message: TeamMessage): void {
 }
 
 function clearMailbox(filePath: string): void {
-	const dir = path.dirname(filePath);
-	const tmpFile = path.join(dir, `.tmp-clear-${Date.now()}-${Math.random().toString(36).slice(2)}`);
-	fs.writeFileSync(tmpFile, "", { encoding: "utf-8" });
-	fs.renameSync(tmpFile, filePath);
+	// Truncate in place — do NOT rename/replace the file.
+	// fs.watch() on macOS watches the inode; renaming a new file over
+	// the original replaces the inode and silently breaks the watcher,
+	// causing all subsequent mailbox messages to be missed.
+	fs.writeFileSync(filePath, "", { encoding: "utf-8" });
 }
 
 // ─── cmux CLI helpers ────────────────────────────────────────────────────────
@@ -697,6 +706,31 @@ function setupMailboxWatching(
 	} catch {
 		// fs.watch may fail on some systems
 	}
+
+	// Polling fallback — fs.watch is unreliable on some platforms and may
+	// silently stop firing events. Poll every 2s as a safety net.
+	const pollInterval = setInterval(() => {
+		try {
+			const stat = fs.statSync(mp);
+			if (stat.size === lastSize || stat.size === 0) return;
+			lastSize = stat.size;
+
+			const messages = readMailbox(mp);
+			if (messages.length === 0) return;
+
+			if (role === "orchestrator") {
+				processOrchestratorMailbox(pi, ctx, task, messages);
+			} else {
+				processWorkerMailbox(pi, ctx, task, role, messages);
+			}
+			clearMailbox(mp);
+		} catch {
+			// Mailbox file might be temporarily unavailable
+		}
+	}, 2000);
+
+	// Store interval so it can be cleaned up on session shutdown
+	activeWatchers.push({ close: () => clearInterval(pollInterval) } as unknown as fs.FSWatcher);
 }
 
 // ─── Main extension ──────────────────────────────────────────────────────────
@@ -1321,12 +1355,51 @@ export default function teamExtension(pi: ExtensionAPI) {
 		};
 	});
 
+	// ─── Input interception: auto-route chat to active task ─────────────────
+
+	pi.on("input", async (event, ctx) => {
+		// Only intercept when we have an active, non-complete orchestrator task with autoRoute enabled
+		if (!currentTeamState || currentTeamState.isComplete || !currentTeamState._autoRoute) {
+			return; // Let input pass through normally
+		}
+
+		const text = event.text?.trim();
+		if (!text) return;
+
+		// Always pass through slash commands and bash commands
+		if (text.startsWith("/") || text.startsWith("!")) return;
+
+		// Only intercept interactive input (not from RPC/extensions)
+		if (event.source !== "interactive") return;
+
+		// Route this message to the orchestrator as a task update
+		const taskName = currentTeamState.task;
+		const state = loadState(ctx.cwd, taskName);
+		if (!state || state.isComplete) return;
+
+		currentTeamState = state;
+
+		// Pass the user's message as extraInfo so the orchestrator sees it
+		// without mutating the original task description
+		const extraInfo = `**User message:** ${text}`;
+
+		// Trigger orchestration with the user's text as context
+		triggerOrchestration(pi, ctx, state, "User message received", extraInfo);
+		updateTeamWidget(ctx, state);
+
+		// Show a notification so the user can see their message was routed
+		ctx.ui.notify(`📩 Routed to team: ${text.substring(0, 80)}${text.length > 80 ? "..." : ""}`, "info");
+
+		// Consume the input so pi doesn't also process it as a normal message
+		return { action: "handled" };
+	});
+
 	// ─── /team command ────────────────────────────────────────────────────
 
 	pi.registerCommand("team", {
 		description: "Manage dynamic multi-agent team workflows",
 		getArgumentCompletions: (prefix: string) => {
-			const subcommands = ["init", "send", "status", "redo", "shutdown", "list", "history"];
+			const subcommands = ["init", "send", "status", "redo", "detach", "attach", "shutdown", "list", "history"];
 			return subcommands
 				.filter((s) => s.startsWith(prefix))
 				.map((s) => ({ value: s, label: s }));
@@ -1409,6 +1482,7 @@ export default function teamExtension(pi: ExtensionAPI) {
 						isComplete: false,
 						dispatchCount: 0,
 						maxDispatches: MAX_DISPATCHES,
+						_autoRoute: true,
 						pendingTrigger: null,
 						pendingTriggerExtra: null,
 					};
@@ -1447,18 +1521,32 @@ export default function teamExtension(pi: ExtensionAPI) {
 					ctx.ui.setStatus("team-phase", ctx.ui.theme.fg("accent", `🔷 orchestrating (0/${MAX_DISPATCHES})`));
 
 					const agentList = roster.map((a) => `  🔵 ${a.name} — ${a.description}`).join("\n");
-					ctx.ui.notify(`Team initialized for "${taskName}"\nAgents:\n${agentList}\n\nUse /team send ${taskName} <task-details> to start.`, "info");
+					ctx.ui.notify(`Team initialized for "${taskName}"\nAgents:\n${agentList}\n\nChat naturally or use /team send <task-details> to start. Use /team detach to disable auto-routing.`, "info");
 					await cmuxLog("info", `Team initialized for ${taskName} with agents: ${roster.map((a) => a.name).join(", ")}`);
 					break;
 				}
 
 				// ─── /team send ─────────────────────────────────────────
 				case "send": {
-					const taskName = parts[1];
-					const taskDetails = parts.slice(2).join(" ");
+					// Heuristic: if parts[1] is an existing workflow directory, use old 2-arg form
+					let taskName: string;
+					let taskDetails: string;
 
-					if (!taskName || !taskDetails) {
-						ctx.ui.notify("Usage: /team send <task-name> <task-details>", "warning");
+					if (parts[1] && fs.existsSync(workflowDir(ctx.cwd, parts[1]))) {
+						// Old form: /team send <task-name> <task-details>
+						taskName = parts[1];
+						taskDetails = parts.slice(2).join(" ");
+					} else if (currentTeamState) {
+						// Simplified form: /team send <task-details> (uses active task)
+						taskName = currentTeamState.task;
+						taskDetails = parts.slice(1).join(" ");
+					} else {
+						ctx.ui.notify("Usage: /team send <task-details> (or /team send <task-name> <task-details> if no active task)", "warning");
+						return;
+					}
+
+					if (!taskDetails) {
+						ctx.ui.notify("Usage: /team send <task-details>", "warning");
 						return;
 					}
 
@@ -1730,13 +1818,43 @@ export default function teamExtension(pi: ExtensionAPI) {
 					break;
 				}
 
+				// ─── /team detach ─────────────────────────────────────
+				case "detach": {
+					if (!currentTeamState) {
+						ctx.ui.notify("No active team session.", "warning");
+						return;
+					}
+					currentTeamState._autoRoute = false;
+					saveState(ctx.cwd, currentTeamState);
+					ctx.ui.notify("🔇 Auto-route detached. Your messages will no longer be sent to the team automatically. Use /team attach to re-enable.", "info");
+					break;
+				}
+
+				// ─── /team attach ─────────────────────────────────────
+				case "attach": {
+					if (!currentTeamState) {
+						ctx.ui.notify("No active team session.", "warning");
+						return;
+					}
+					if (currentTeamState.isComplete) {
+						ctx.ui.notify("Task is already complete. Auto-routing has no effect.", "warning");
+						return;
+					}
+					currentTeamState._autoRoute = true;
+					saveState(ctx.cwd, currentTeamState);
+					ctx.ui.notify("🔊 Auto-route attached. Your messages will be sent to the team automatically. Use /team detach to disable.", "info");
+					break;
+				}
+
 				default: {
 					ctx.ui.notify(
 						"Unknown command. Usage:\n" +
 							"  /team init <task-name> <agent>...\n" +
-							"  /team send <task-name> <task-details>\n" +
+							"  /team send [task] <task-details>\n" +
 							"  /team status [task-name]\n" +
 							"  /team redo <task-name> <agent> [message]\n" +
+							"  /team detach\n" +
+							"  /team attach\n" +
 							"  /team shutdown [task-name]\n" +
 							"  /team list\n" +
 							"  /team history [task-name]",
