@@ -249,9 +249,11 @@ async function cmuxCloseSurface(surfaceId: string): Promise<void> {
 	}
 }
 
-async function cmuxRenameTab(surfaceId: string, title: string): Promise<void> {
+async function cmuxRenameTab(surfaceId: string | undefined, title: string): Promise<void> {
 	try {
-		await cmuxExec("rename-tab", "--surface", surfaceId, title);
+		const sid = surfaceId ?? process.env.CMUX_SURFACE_ID;
+		if (!sid) return;
+		await cmuxExec("rename-tab", "--surface", sid, title);
 	} catch {
 		// Best effort
 	}
@@ -1229,7 +1231,9 @@ export default function teamExtension(pi: ExtensionAPI) {
 			if (state) {
 				currentTeamState = state;
 				setupMailboxWatching(pi, ctx, sessionTask, "orchestrator");
-				pi.setSessionName(`🔷 ${sessionTask}`);
+				const orchLabel = `🔷 orchestrator: ${sessionTask}`;
+				pi.setSessionName(orchLabel);
+				await cmuxRenameTab(undefined, orchLabel);
 
 				updateTeamWidget(ctx, state);
 			}
@@ -1508,7 +1512,9 @@ export default function teamExtension(pi: ExtensionAPI) {
 					updateTeamWidget(ctx, currentTeamState);
 
 					// Name the session
-					pi.setSessionName(`🔷 ${taskName}`);
+					const orchLabel = `🔷 orchestrator: ${taskName}`;
+					pi.setSessionName(orchLabel);
+					await cmuxRenameTab(undefined, orchLabel);
 
 					const agentList = roster.map((a) => `  🔵 ${a.name} — ${a.description}`).join("\n");
 					ctx.ui.notify(`Team initialized for "${taskName}"\nAgents:\n${agentList}\n\nChat naturally or use /team send <task-details> to start. Use /team detach to disable auto-routing.`, "info");
