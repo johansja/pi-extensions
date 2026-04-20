@@ -936,8 +936,6 @@ export default function teamExtension(pi: ExtensionAPI) {
 					});
 				}
 
-				ctx.ui.setStatus("team-phase", ctx.ui.theme.fg("accent", "✅ done"));
-
 				return {
 					content: [{
 						type: "text",
@@ -1231,13 +1229,7 @@ export default function teamExtension(pi: ExtensionAPI) {
 			if (state) {
 				currentTeamState = state;
 				setupMailboxWatching(pi, ctx, sessionTask, "orchestrator");
-				pi.setSessionName(`🔷 Orchestrator: ${sessionTask}`);
-
-				if (state.isComplete) {
-					ctx.ui.setStatus("team-phase", ctx.ui.theme.fg("accent", "✅ done"));
-				} else {
-					ctx.ui.setStatus("team-phase", ctx.ui.theme.fg("accent", `🔷 orchestrating (${state.dispatchCount}/${state.maxDispatches})`));
-				}
+				pi.setSessionName(`🔷 ${sessionTask}`);
 
 				updateTeamWidget(ctx, state);
 			}
@@ -1325,7 +1317,6 @@ export default function teamExtension(pi: ExtensionAPI) {
 		}
 
 		// Clear team status and widget
-		ctx.ui.setStatus("team-phase", undefined);
 		ctx.ui.setWidget("team-dashboard", undefined);
 	});
 
@@ -1517,8 +1508,7 @@ export default function teamExtension(pi: ExtensionAPI) {
 					updateTeamWidget(ctx, currentTeamState);
 
 					// Name the session
-					pi.setSessionName(`🔷 Orchestrator: ${taskName}`);
-					ctx.ui.setStatus("team-phase", ctx.ui.theme.fg("accent", `🔷 orchestrating (0/${MAX_DISPATCHES})`));
+					pi.setSessionName(`🔷 ${taskName}`);
 
 					const agentList = roster.map((a) => `  🔵 ${a.name} — ${a.description}`).join("\n");
 					ctx.ui.notify(`Team initialized for "${taskName}"\nAgents:\n${agentList}\n\nChat naturally or use /team send <task-details> to start. Use /team detach to disable auto-routing.`, "info");
@@ -1754,7 +1744,6 @@ export default function teamExtension(pi: ExtensionAPI) {
 						saveState(ctx.cwd, state);
 					}
 
-					ctx.ui.setStatus("team-phase", undefined);
 					ctx.ui.setWidget("team-dashboard", undefined);
 					ctx.ui.notify(`Shutdown sent for "${taskName}"`, "info");
 					break;
