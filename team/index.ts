@@ -13,6 +13,8 @@
  *   /team status [name]              — Show workflow state
  *   /team redo <name> <agent> [msg]  — Re-dispatch an agent (manual override)
  *   /team shutdown [name]            — Graceful shutdown of all workers
+ *   /team resume [name]              — Resume an interrupted team session
+ *   /team complete [name]            — Mark team as completed and clean up
  *   /team list                       — List available agents
  *   /team history [name]             — Show dispatch history
  *
@@ -42,7 +44,7 @@ const activeWatchers: fs.FSWatcher[] = [];
 
 // ─── Types & Constants ───────────────────────────────────────────────────────
 
-const MAX_DISPATCHES = parseInt(process.env.PI_TEAM_MAX_DISPATCHES ?? "30", 10);
+
 
 interface AgentRosterEntry {
 	name: string;
@@ -65,6 +67,7 @@ interface DispatchEntry {
 interface TeamState {
 	task: string;
 	role: "orchestrator";
+	status: "active" | "shutdown" | "completed";
 	agents: AgentRosterEntry[];
 	agentStatus: Record<string, "idle" | "working">;
 	orchestratorPaneId: string | null;
@@ -124,6 +127,10 @@ function loadState(cwd: string, task: string): TeamState | null {
 		// Backward compat: state files created before orchestratorPaneId was added
 		if (state.orchestratorPaneId === undefined) {
 			(state as any).orchestratorPaneId = null;
+		}
+		// Backward compat: state files created before status was added
+		if (state.status === undefined) {
+			(state as any).status = "active";
 		}
 		return state;
 	} catch {
@@ -284,6 +291,212 @@ function terminalNotify(title: string, body: string): void {
 	}
 }
 
+// ─── Team resumption helpers ──────────────────────────────────────────────────
+
+interface AvailableTeam {
+	task: string;
+	status: "active" | "shutdown" | "completed";
+	agentCount: number;
+	dispatchCount: number;
+	maxDispatches: number;
+	lastActivity: number;
+	hasWorkingAgents: boolean;
+}
+
+function listAvailableTeams(cwd: string, defaultMaxDispatches: number = 30): AvailableTeam[] {
+	const workflowRoot = path.join(cwd, ".pi", "workflow");
+	const teams: AvailableTeam[] = [];
+
+	try {
+		if (!fs.existsSync(workflowRoot)) return teams;
+
+		const entries = fs.readdirSync(workflowRoot, { withFileTypes: true });
+		for (const entry of entries) {
+			if (!entry.isDirectory()) continue;
+			const sp = path.join(workflowRoot, entry.name, "state.json");
+			try {
+				const content = fs.readFileSync(sp, "utf-8").trim();
+				if (!content) continue;
+				const state = JSON.parse(content) as TeamState;
+				const hasWorkingAgents = Object.values(state.agentStatus ?? {}).some(s => s === "working");
+				let lastActivity = 0;
+				for (const d of (state.dispatchHistory ?? [])) {
+					if (d.timestamp > lastActivity) lastActivity = d.timestamp;
+				}
+				// Fallback to file mtime for new teams with no dispatches
+				if (lastActivity === 0) {
+					try { lastActivity = fs.statSync(sp).mtimeMs; } catch { /* ignore */ }
+				}
+				teams.push({
+					task: state.task ?? entry.name,
+					status: state.status ?? "active",
+					agentCount: (state.agents ?? []).length,
+					dispatchCount: state.dispatchCount ?? 0,
+					maxDispatches: state.maxDispatches ?? defaultMaxDispatches,
+					lastActivity,
+					hasWorkingAgents,
+				});
+			} catch {
+				// Invalid state file, skip
+			}
+		}
+	} catch {
+		// workflow dir not readable
+	}
+
+	// Sort by last activity descending (most recent first)
+	teams.sort((a, b) => b.lastActivity - a.lastActivity);
+	return teams;
+}
+
+function buildResumeContext(state: TeamState): string {
+	const lines: string[] = [];
+
+	lines.push("🔄 **Session Resumed — Team \"" + state.task + "\"**");
+	lines.push("");
+
+	// Completed work
+	const completedDispatches = state.dispatchHistory.filter(d => d.result && d.result !== "[Session interrupted]" && d.result !== "[Team completed]");
+	const interruptedDispatches = state.dispatchHistory.filter(d => d.result === "[Session interrupted]");
+
+	if (completedDispatches.length > 0) {
+		lines.push("**Completed work:**");
+		for (const d of completedDispatches) {
+			lines.push(`  ✅ ${d.agent}: ${(d.result ?? "").substring(0, 120)}${(d.result ?? "").length > 120 ? "..." : ""}`);
+		}
+		lines.push("");
+	}
+
+	if (interruptedDispatches.length > 0) {
+		lines.push("**Interrupted tasks (agents were working when session ended):**");
+		for (const d of interruptedDispatches) {
+			lines.push(`  ⚠️ ${d.agent}: ${(d.instructions ?? "").substring(0, 120)}${(d.instructions ?? "").length > 120 ? "..." : ""}`);
+		}
+		lines.push("");
+	}
+
+	// Budget
+	const remaining = state.maxDispatches - state.dispatchCount;
+	lines.push(`**Dispatch budget:** ${state.dispatchCount}/${state.maxDispatches} used (${remaining} remaining)`);
+	lines.push("");
+
+	// Agent roster
+	lines.push("**Agents:**");
+	for (const agent of state.agents) {
+		const status = state.agentStatus[agent.name] ?? "idle";
+		const icon = statusIcon(status);
+		lines.push(`  ${icon} ${agent.name} (${status}) — ${agent.description}`);
+	}
+	lines.push("");
+
+	// Next step instruction
+	if (interruptedDispatches.length > 0) {
+		lines.push("**Next step:** The interrupted agents have been marked idle. Re-dispatch them to continue their work, or adjust the plan based on what was already completed.");
+	} else if (completedDispatches.length > 0 && remaining > 0) {
+		lines.push("**Next step:** Review the completed work and dispatch the next agent to continue.");
+	} else if (remaining <= 0) {
+		lines.push("**Next step:** No dispatches remaining. Consider using /team complete to finalize.");
+	} else {
+		lines.push("**Next step:** Start dispatching agents using team_orchestrate.");
+	}
+
+	return lines.join("\n");
+}
+
+async function resumeTeam(pi: ExtensionAPI, ctx: ExtensionContext, taskName: string): Promise<TeamState | null> {
+	const state = loadState(ctx.cwd, taskName);
+	if (!state) {
+		ctx.ui.notify(`No workflow state found for "${taskName}"`, "error");
+		return null;
+	}
+
+	if (state.status === "completed") {
+		ctx.ui.notify(`Team "${taskName}" is already completed. Use /team init to start a new team.`, "warning");
+		return null;
+	}
+
+	// Guard for empty/undefined agents
+	if (!state.agents || state.agents.length === 0) {
+		ctx.ui.notify(`Team "${taskName}" has no agents. Use /team init to create a new team.`, "warning");
+		return null;
+	}
+
+	// Clean up stale watchers before setting up new ones
+	for (const watcher of activeWatchers) {
+		try { watcher.close(); } catch { /* best effort */ }
+	}
+	activeWatchers.length = 0;
+
+	// Repair stale state
+	// 1. Mark all agents idle
+	for (const agent of state.agents) {
+		state.agentStatus[agent.name] = "idle";
+	}
+
+	// 2. Add synthetic "[Session interrupted]" results for mid-task dispatches
+	for (const entry of state.dispatchHistory) {
+		if (!entry.result) {
+			entry.result = "[Session interrupted]";
+		}
+	}
+
+	// 3. Clear surfaceIds (surfaces are stale after session end)
+	state.surfaceIds = {};
+
+	// 4. Clear orchestratorPaneId (stale after session end)
+	state.orchestratorPaneId = null;
+
+	// 5. Mark as active
+	state.status = "active";
+
+	// Save repaired state
+	saveState(ctx.cwd, state);
+
+	// Save session state
+	saveSessionState(pi, state);
+
+	// Set up mailbox watching
+	setupMailboxWatching(pi, ctx, taskName, "orchestrator");
+
+	// Re-resolve orchestrator pane ID
+	state.orchestratorPaneId = await cmuxGetPaneId();
+
+	// Re-spawn all agent tabs
+	for (const agent of state.agents) {
+		const { surfaceId } = await spawnAgent(
+			pi, ctx, agent, taskName,
+			state.orchestratorPaneId,
+			async () => {
+				state.orchestratorPaneId = await cmuxGetPaneId();
+				return state.orchestratorPaneId;
+			},
+		);
+
+		if (surfaceId) {
+			state.surfaceIds[agent.name] = surfaceId;
+		}
+	}
+
+	// Save state with new surface IDs
+	saveState(ctx.cwd, state);
+
+	// Set session name and update widget
+	const orchLabel = `🔷 orchestrator: ${taskName}`;
+	pi.setSessionName(orchLabel);
+	await cmuxRenameTab(undefined, orchLabel);
+
+	updateTeamWidget(ctx, state);
+
+	// Inject resume context as user message so orchestrator LLM picks it up
+	const resumeContext = buildResumeContext(state);
+	pi.sendUserMessage(resumeContext, { deliverAs: "followUp" });
+
+	ctx.ui.notify(`Team "${taskName}" resumed. ${state.agents.length} agents re-spawned.`, "info");
+	await cmuxLog("info", `Team "${taskName}" resumed with ${state.agents.length} agents`);
+
+	return state;
+}
+
 // ─── Orchestrator context builder ────────────────────────────────────────────
 
 function statusIcon(status: string): string {
@@ -296,7 +509,7 @@ function statusIcon(status: string): string {
 
 function updateTeamWidget(ctx: ExtensionContext, state: TeamState): void {
 	const lines: string[] = [];
-	lines.push(`🔷 Team: ${state.task}`);
+	lines.push(`🔷 Team: ${state.task} (${state.status ?? "active"})`);
 	lines.push("");
 
 	for (const agent of state.agents) {
@@ -693,6 +906,17 @@ function setupMailboxWatching(
 export default function teamExtension(pi: ExtensionAPI) {
 	let currentTeamState: TeamState | null = null;
 	let currentWorkerState: WorkerState | null = null;
+
+	pi.registerFlag("max-dispatches", {
+		description: "Maximum number of agent dispatches per team session (default: 30)",
+		type: "string",
+		default: "30",
+	});
+
+	function getMaxDispatches(): number {
+		const val = pi.getFlag("max-dispatches");
+		return parseInt(String(val ?? "30"), 10) || 30;
+	}
 
 	// ─── team_orchestrate tool (orchestrator only) ────────────────────────
 
@@ -1117,16 +1341,30 @@ export default function teamExtension(pi: ExtensionAPI) {
 		// Path 2: Orchestrator resume from session state
 		const sessionTask = loadSessionTask(ctx);
 		if (sessionTask) {
-			const state = loadState(ctx.cwd, sessionTask);
-			if (state) {
-				currentTeamState = state;
-				setupMailboxWatching(pi, ctx, sessionTask, "orchestrator");
-				const orchLabel = `🔷 orchestrator: ${sessionTask}`;
-				pi.setSessionName(orchLabel);
-				await cmuxRenameTab(undefined, orchLabel);
+			const resumed = await resumeTeam(pi, ctx, sessionTask);
+			if (resumed) currentTeamState = resumed;
+			return;
+		}
 
-				updateTeamWidget(ctx, state);
+		// Path 3: Auto-detect from .pi/workflow/ if no session entry
+		const availableTeams = listAvailableTeams(ctx.cwd, getMaxDispatches()).filter(t => t.status === "active");
+
+		if (availableTeams.length === 1) {
+			// Exactly one active team — auto-resume
+			const team = availableTeams[0];
+			ctx.ui.notify(`🔄 Found active team "${team.task}". Auto-resuming...`, "info");
+			const resumed = await resumeTeam(pi, ctx, team.task);
+			if (resumed) currentTeamState = resumed;
+		} else if (availableTeams.length > 1) {
+			// Multiple active teams — suggest /team resume
+			const lines: string[] = ["🔄 Multiple active teams found:"];
+			for (const team of availableTeams) {
+				const timeStr = team.lastActivity > 0 ? new Date(team.lastActivity).toLocaleString() : "unknown";
+				lines.push(`  🟢 ${team.task} — Agents: ${team.agentCount} | Dispatches: ${team.dispatchCount}/${team.maxDispatches} | Last: ${timeStr}`);
 			}
+			lines.push("");
+			lines.push("Use /team resume <task-name> to resume a team.");
+			ctx.ui.notify(lines.join("\n"), "info");
 		}
 	});
 
@@ -1240,7 +1478,7 @@ export default function teamExtension(pi: ExtensionAPI) {
 	pi.registerCommand("team", {
 		description: "Manage dynamic multi-agent team workflows",
 		getArgumentCompletions: (prefix: string) => {
-			const subcommands = ["init", "status", "redo", "shutdown", "list", "history"];
+			const subcommands = ["init", "status", "redo", "shutdown", "resume", "complete", "list", "history"];
 			return subcommands
 				.filter((s) => s.startsWith(prefix))
 				.map((s) => ({ value: s, label: s }));
@@ -1320,13 +1558,14 @@ export default function teamExtension(pi: ExtensionAPI) {
 					currentTeamState = {
 						task: taskName,
 						role: "orchestrator",
+						status: "active",
 						agents: roster,
 						agentStatus,
 						orchestratorPaneId: null,
 						surfaceIds: {},
 						dispatchHistory: [],
 						dispatchCount: 0,
-						maxDispatches: MAX_DISPATCHES,
+						maxDispatches: getMaxDispatches(),
 					};
 					saveState(ctx.cwd, currentTeamState);
 					saveSessionState(pi, currentTeamState);
@@ -1389,7 +1628,7 @@ export default function teamExtension(pi: ExtensionAPI) {
 						return;
 					}
 
-					const lines: string[] = [`📋 Team: ${taskName}`];
+					const lines: string[] = [`📋 Team: ${taskName} (${state.status ?? "active"})`];
 
 					lines.push("\n👥 Agents:");
 					for (const agent of state.agents) {
@@ -1525,6 +1764,8 @@ export default function teamExtension(pi: ExtensionAPI) {
 
 					// Send shutdown to all agents
 					if (state) {
+						state.status = "shutdown";
+
 						for (const agent of state.agents) {
 							const mp = mailboxPath(ctx.cwd, taskName, agent.name);
 							appendToMailbox(mp, {
@@ -1545,7 +1786,102 @@ export default function teamExtension(pi: ExtensionAPI) {
 					}
 
 					ctx.ui.setWidget("team-dashboard", undefined);
+					if (currentTeamState?.task === taskName) {
+						currentTeamState = null;
+					}
 					ctx.ui.notify(`Shutdown sent for "${taskName}"`, "info");
+					break;
+				}
+
+				// ─── /team resume ──────────────────────────────────────
+				case "resume": {
+					const taskName = parts[1];
+
+					if (!taskName) {
+						// No arg — list available teams
+						const teams = listAvailableTeams(ctx.cwd, getMaxDispatches());
+						if (teams.length === 0) {
+							ctx.ui.notify("No teams found in .pi/workflow/", "info");
+							return;
+						}
+
+						const lines: string[] = ["🔄 Available Teams:\n"];
+						for (const team of teams) {
+							const statusIcon = team.status === "active" ? "🟢" : team.status === "shutdown" ? "🔴" : "✅";
+							const workingTag = team.hasWorkingAgents ? " (has working agents)" : "";
+							const timeStr = team.lastActivity > 0 ? new Date(team.lastActivity).toLocaleString() : "unknown";
+							lines.push(`  ${statusIcon} ${team.task} — ${team.status}${workingTag}`);
+							lines.push(`     Agents: ${team.agentCount} | Dispatches: ${team.dispatchCount}/${team.maxDispatches} | Last activity: ${timeStr}`);
+						}
+
+						lines.push("");
+						lines.push("Use /team resume <task-name> to resume a team.");
+
+						ctx.ui.notify(lines.join("\n"), "info");
+						return;
+					}
+
+					const resumed = await resumeTeam(pi, ctx, taskName);
+					if (resumed) currentTeamState = resumed;
+					break;
+				}
+
+				// ─── /team complete ────────────────────────────────────
+				case "complete": {
+					const taskName = parts[1] ?? currentTeamState?.task ?? loadSessionTask(ctx);
+
+					if (!taskName) {
+						ctx.ui.notify("Usage: /team complete [task-name]", "warning");
+						return;
+					}
+
+					const state = currentTeamState ?? loadState(ctx.cwd, taskName);
+					if (!state) {
+						ctx.ui.notify(`No workflow found for "${taskName}"`, "warning");
+						return;
+					}
+
+					// Mark any in-progress dispatches as completed
+					for (const entry of state.dispatchHistory) {
+						if (!entry.result) {
+							entry.result = "[Team completed]";
+						}
+					}
+
+					// Mark all agents idle
+					for (const agent of state.agents) {
+						state.agentStatus[agent.name] = "idle";
+					}
+
+					state.status = "completed";
+
+					// Send shutdown to all agents
+					for (const agent of state.agents) {
+						const mp = mailboxPath(ctx.cwd, taskName, agent.name);
+						appendToMailbox(mp, {
+							type: "shutdown",
+							from: "orchestrator",
+							to: agent.name,
+							body: "Team completed. Thank you!",
+							timestamp: Date.now(),
+						});
+					}
+
+					// Close cmux surfaces
+					for (const surfaceId of Object.values(state.surfaceIds)) {
+						await cmuxCloseSurface(surfaceId);
+					}
+
+					saveState(ctx.cwd, state);
+
+					// Clear widget and session state
+					ctx.ui.setWidget("team-dashboard", undefined);
+					if (currentTeamState?.task === taskName) {
+						currentTeamState = null;
+					}
+
+					ctx.ui.notify(`✅ Team "${taskName}" marked as completed.`, "info");
+					await cmuxLog("info", `Team "${taskName}" marked as completed`);
 					break;
 				}
 
@@ -1618,6 +1954,8 @@ export default function teamExtension(pi: ExtensionAPI) {
 							"  /team status [team-name]\n" +
 							"  /team redo <team-name> <agent> [message]\n" +
 							"  /team shutdown [team-name]\n" +
+							"  /team resume [task-name]\n" +
+							"  /team complete [task-name]\n" +
 							"  /team list\n" +
 							"  /team history [team-name]",
 						"info",
