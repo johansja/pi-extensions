@@ -9,7 +9,7 @@
  * talk to each other directly.
  *
  * Commands:
- *   /team init <name> <agent>...     — Create team, become orchestrator
+ *   /team init <name> [<agent>...]   — Create team, become orchestrator (omitting agents loads all)
  *   /team status [name]              — Show workflow state
  *   /team redo <name> <agent> [msg]  — Re-dispatch an agent (manual override)
  *   /team shutdown [name]            — Graceful shutdown of all workers
@@ -59,6 +59,7 @@ interface DispatchEntry {
 	instructions: string;
 	timestamp: number;
 	result?: string;
+	questions?: string[];
 }
 
 interface TeamState {
@@ -66,6 +67,7 @@ interface TeamState {
 	role: "orchestrator";
 	agents: AgentRosterEntry[];
 	agentStatus: Record<string, "idle" | "working">;
+	orchestratorPaneId: string | null;
 	surfaceIds: Record<string, string>;
 	dispatchHistory: DispatchEntry[];
 	dispatchCount: number;
@@ -106,14 +108,6 @@ function mailboxPath(cwd: string, task: string, agent: string): string {
 	return path.join(mailboxDir(cwd, task), `${agent}.json`);
 }
 
-function reportsDir(cwd: string, task: string): string {
-	return path.join(workflowDir(cwd, task), "reports");
-}
-
-function reportPath(cwd: string, task: string, agent: string): string {
-	return path.join(reportsDir(cwd, task), `${agent}.md`);
-}
-
 // ─── State persistence ───────────────────────────────────────────────────────
 
 function saveState(cwd: string, state: TeamState): void {
@@ -126,7 +120,12 @@ function loadState(cwd: string, task: string): TeamState | null {
 	try {
 		const content = fs.readFileSync(sp, "utf-8").trim();
 		if (!content) return null;
-		return JSON.parse(content) as TeamState;
+		const state = JSON.parse(content) as TeamState;
+		// Backward compat: state files created before orchestratorPaneId was added
+		if (state.orchestratorPaneId === undefined) {
+			(state as any).orchestratorPaneId = null;
+		}
+		return state;
 	} catch {
 		return null;
 	}
@@ -203,14 +202,21 @@ async function cmuxExec(...args: string[]): Promise<{ stdout: string; stderr: st
 	}
 }
 
-async function cmuxSplitPane(direction: string = "right", splitFromSurfaceId?: string): Promise<string | null> {
+async function cmuxNewSurface(paneId: string): Promise<string | null> {
 	try {
-		const args = splitFromSurfaceId
-			? ["new-split", direction, "--surface", splitFromSurfaceId]
-			: ["new-split", direction];
-		const { stdout } = await cmuxExec(...args);
+		const { stdout } = await cmuxExec("new-surface", "--pane", paneId);
 		const match = stdout.match(/surface:(\d+)/i);
 		return match ? `surface:${match[1]}` : null;
+	} catch {
+		return null;
+	}
+}
+
+async function cmuxGetPaneId(): Promise<string | null> {
+	try {
+		const { stdout } = await cmuxExec("identify");
+		const match = stdout.match(/pane:(\d+)/i);
+		return match ? `pane:${match[1]}` : null;
 	} catch {
 		return null;
 	}
@@ -431,8 +437,8 @@ async function spawnAgent(
 	ctx: ExtensionContext,
 	agent: AgentRosterEntry,
 	task: string,
-	splitDirection?: string,
-	splitFromSurfaceId?: string,
+	paneId?: string | null,
+	resolvePaneId?: () => Promise<string | null>,
 ): Promise<{ surfaceId: string | null }> {
 	// Generate context temp file
 	const tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-team-"));
@@ -445,9 +451,8 @@ async function spawnAgent(
 		`## Workflow Resources`,
 		``,
 		`- Workflow directory: \`.pi/workflow/${task}/\``,
-		`- Write your report to: \`.pi/workflow/${task}/reports/${agent.name}.md\``,
 		`- Your mailbox: \`.pi/workflow/${task}/mailbox/${agent.name}.json\``,
-		`- Other agents' reports: \`.pi/workflow/${task}/reports/\``,
+		`- Other agents' reports: Use \`team_read_deliverables\` tool`,
 		``,
 		`## Communication Protocol`,
 		``,
@@ -471,7 +476,9 @@ async function spawnAgent(
 	// Build the pi command
 	const args: string[] = [];
 	if (agent.model) args.push("--model", agent.model);
-	if (agent.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
+	if (agent.tools && agent.tools.length > 0 && !agent.tools.includes("all")) {
+		args.push("--tools", agent.tools.join(","));
+	}
 	if (agent.thinking) args.push("--thinking", agent.thinking);
 	args.push("--append-system-prompt", agent.filePath);
 	args.push("--append-system-prompt", contextFile);
@@ -479,12 +486,17 @@ async function spawnAgent(
 	// Set env vars for team identity
 	const envPrefix = `PI_TEAM_TASK=${task} PI_TEAM_ROLE=${agent.name}`;
 
-	// Try cmux split
+	// Try cmux new-surface (tab within the orchestrator's pane)
+	// If the pane ID is stale (pane was recreated), retry once with a fresh ID
 	let surfaceId: string | null = null;
-	try {
-		surfaceId = await cmuxSplitPane(splitDirection ?? "right", splitFromSurfaceId);
-	} catch {
-		// cmux not available
+	if (paneId) {
+		surfaceId = await cmuxNewSurface(paneId);
+		if (!surfaceId && resolvePaneId) {
+			const freshPaneId = await resolvePaneId();
+			if (freshPaneId) {
+				surfaceId = await cmuxNewSurface(freshPaneId);
+			}
+		}
 	}
 
 	if (surfaceId) {
@@ -522,10 +534,13 @@ function processOrchestratorMailbox(
 	for (const msg of messages) {
 		if (msg.type === "done") {
 			hasActionableMessage = true;
-			// Update dispatch history with result
+			// Update dispatch history with result and questions
 			for (let i = state.dispatchHistory.length - 1; i >= 0; i--) {
 				if (state.dispatchHistory[i].agent === msg.from && !state.dispatchHistory[i].result) {
 					state.dispatchHistory[i].result = msg.summary ?? "";
+					if (msg.questions && msg.questions.length > 0) {
+						state.dispatchHistory[i].questions = msg.questions;
+					}
 					break;
 				}
 			}
@@ -566,7 +581,10 @@ function processOrchestratorMailbox(
 		} else if (messages.some(m => m.type === "notify")) {
 			reason = "Agent sent a notification";
 		}
-		pi.sendUserMessage(`🔄 Team update: ${reason}`, { deliverAs: "followUp" });
+		const fullMessage = parts.length > 0
+			? `🔄 Team update: ${reason}\n\n${parts.join("\n\n")}`
+			: `🔄 Team update: ${reason}`;
+		pi.sendUserMessage(fullMessage, { deliverAs: "followUp" });
 	}
 }
 
@@ -795,19 +813,24 @@ export default function teamExtension(pi: ExtensionAPI) {
 					timestamp: Date.now(),
 				});
 
-				// Spawn agent if no surface exists (pane was closed, agent crashed, etc.)
+				// Spawn agent if no surface exists (surface was closed, agent crashed, etc.)
 				const existingSurfaceId = state.surfaceIds[params.agent];
 				if (existingSurfaceId && !(await cmuxSurfaceExists(existingSurfaceId))) {
 					delete state.surfaceIds[params.agent];
 				}
 				if (!state.surfaceIds[params.agent]) {
-					const existingSurfaces = Object.values(state.surfaceIds);
-					const lastSurface = existingSurfaces.length > 0 ? existingSurfaces[existingSurfaces.length - 1] : undefined;
+					// Resolve orchestrator pane ID if not yet known
+					if (!state.orchestratorPaneId) {
+						state.orchestratorPaneId = await cmuxGetPaneId();
+					}
 
 					const { surfaceId } = await spawnAgent(
 						pi, ctx, rosterEntry, task,
-						existingSurfaces.length === 0 ? "right" : "down",
-						lastSurface,
+						state.orchestratorPaneId,
+						async () => {
+							state.orchestratorPaneId = await cmuxGetPaneId();
+							return state.orchestratorPaneId;
+						},
 					);
 
 					if (surfaceId) {
@@ -888,29 +911,17 @@ export default function teamExtension(pi: ExtensionAPI) {
 				};
 			}
 
-			// Write report file
-			const rp = reportPath(ctx.cwd, task, role);
-			fs.mkdirSync(path.dirname(rp), { recursive: true });
-			const reportContent = [
-				`# Report: ${role}`,
-				"",
-				`## Summary`,
-				params.summary,
-				"",
-				...(params.questions && params.questions.length > 0
-					? ["## Questions", ...params.questions.map((q) => `- ${q}`), ""]
-					: []),
-			].join("\n");
-			fs.writeFileSync(rp, reportContent, { encoding: "utf-8" });
-
 			// Update state
 			const state = loadState(ctx.cwd, task);
 			if (state) {
 				state.agentStatus[role] = "idle";
-				// Update dispatch history result
+				// Update dispatch history result and questions
 				for (let i = state.dispatchHistory.length - 1; i >= 0; i--) {
 					if (state.dispatchHistory[i].agent === role && !state.dispatchHistory[i].result) {
 						state.dispatchHistory[i].result = params.summary;
+						if (params.questions && params.questions.length > 0) {
+							state.dispatchHistory[i].questions = params.questions;
+						}
 						break;
 					}
 				}
@@ -1052,13 +1063,17 @@ export default function teamExtension(pi: ExtensionAPI) {
 
 			const parts: string[] = [];
 
-			// Read all reports
-			const rdir = reportsDir(ctx.cwd, task);
-			if (fs.existsSync(rdir)) {
-				const reportFiles = fs.readdirSync(rdir).filter((f) => f.endsWith(".md"));
-				for (const rf of reportFiles) {
-					const content = fs.readFileSync(path.join(rdir, rf), "utf-8");
-					parts.push(`## ${rf}\n\n${content}`);
+			// Read all reports from dispatch history
+			const state = loadState(ctx.cwd, task);
+			if (state) {
+				for (const entry of state.dispatchHistory) {
+					if (entry.result) {
+						let section = `## ${entry.agent}\n\n${entry.result}`;
+						if (entry.questions && entry.questions.length > 0) {
+							section += "\n\n### Questions\n" + entry.questions.map(q => `- ${q}`).join("\n");
+						}
+						parts.push(section);
+					}
 				}
 			}
 
@@ -1155,7 +1170,7 @@ export default function teamExtension(pi: ExtensionAPI) {
 		}
 		activeWatchers.length = 0;
 
-		// If orchestrator: send shutdown messages and close cmux panes
+		// If orchestrator: send shutdown messages and close cmux surfaces
 		if (currentTeamState) {
 			const state = currentTeamState;
 			for (const agent of state.agents) {
@@ -1169,7 +1184,7 @@ export default function teamExtension(pi: ExtensionAPI) {
 				});
 			}
 
-			// Close cmux panes
+			// Close cmux surfaces
 			for (const surfaceId of Object.values(state.surfaceIds)) {
 				await cmuxCloseSurface(surfaceId);
 			}
@@ -1241,42 +1256,47 @@ export default function teamExtension(pi: ExtensionAPI) {
 					const agentNames = parts.slice(2);
 
 					if (!taskName) {
-						ctx.ui.notify("Usage: /team init <task-name> <agent>...", "warning");
-						return;
-					}
-
-					if (agentNames.length === 0) {
-						ctx.ui.notify("Usage: /team init <task-name> <agent>...\nSpecify at least one agent. Use /team list to see available agents.", "warning");
+						ctx.ui.notify("Usage: /team init <task-name> [<agent>...]", "warning");
 						return;
 					}
 
 					// Discover available agents
 					const discovery = discoverAgents(ctx.cwd, "both");
-					const roster: AgentRosterEntry[] = [];
-					const notFound: string[] = [];
 
-					for (const name of agentNames) {
-						const agent = discovery.agents.find((a) => a.name === name);
-						if (!agent) {
-							notFound.push(name);
-						} else {
-							roster.push(agentConfigToRosterEntry(agent));
+					let roster: AgentRosterEntry[];
+
+					if (agentNames.length === 0) {
+						// No agents specified — load all discovered agents
+						if (discovery.agents.length === 0) {
+							ctx.ui.notify("No agents found.\n\nAdd agent .md files to:\n  ~/.pi/agent/team/ (user-level)\n  .pi/team/ (project-level)", "error");
+							return;
 						}
-					}
+						roster = discovery.agents.map(agentConfigToRosterEntry);
+					} else {
+						roster = [];
+						const notFound: string[] = [];
 
-					if (notFound.length > 0) {
-						const available = discovery.agents.map((a) => a.name).join(", ") || "none";
-						ctx.ui.notify(`Unknown agent(s): ${notFound.join(", ")}\nAvailable agents: ${available}`, "error");
-						return;
+						for (const name of agentNames) {
+							const agent = discovery.agents.find((a) => a.name === name);
+							if (!agent) {
+								notFound.push(name);
+							} else {
+								roster.push(agentConfigToRosterEntry(agent));
+							}
+						}
+
+						if (notFound.length > 0) {
+							const available = discovery.agents.map((a) => a.name).join(", ") || "none";
+							ctx.ui.notify(`Unknown agent(s): ${notFound.join(", ")}\nAvailable agents: ${available}`, "error");
+							return;
+						}
 					}
 
 					// Create workflow directory structure
 					const dir = workflowDir(ctx.cwd, taskName);
 					const mdir = mailboxDir(ctx.cwd, taskName);
-					const rdir = reportsDir(ctx.cwd, taskName);
 					fs.mkdirSync(dir, { recursive: true });
 					fs.mkdirSync(mdir, { recursive: true });
-					fs.mkdirSync(rdir, { recursive: true });
 
 					// Initialize mailbox files
 					for (const agent of roster) {
@@ -1302,6 +1322,7 @@ export default function teamExtension(pi: ExtensionAPI) {
 						role: "orchestrator",
 						agents: roster,
 						agentStatus,
+						orchestratorPaneId: null,
 						surfaceIds: {},
 						dispatchHistory: [],
 						dispatchCount: 0,
@@ -1313,21 +1334,26 @@ export default function teamExtension(pi: ExtensionAPI) {
 					// Start watching orchestrator mailbox
 					setupMailboxWatching(pi, ctx, taskName, "orchestrator");
 
-					// Spawn all agents in cmux panes
-					let lastSuccessfulSurfaceId: string | undefined;
+					// Resolve orchestrator pane ID if not yet known
+					if (!currentTeamState.orchestratorPaneId) {
+						currentTeamState.orchestratorPaneId = await cmuxGetPaneId();
+					}
+
+					// Spawn all agents as tabs in the orchestrator's pane
 					for (let i = 0; i < roster.length; i++) {
 						const agent = roster[i];
-						const isFirstAgent = i === 0;
-						const splitDir = isFirstAgent ? "right" : "down";
 
 						const { surfaceId } = await spawnAgent(
 							pi, ctx, agent, taskName,
-							splitDir, isFirstAgent ? undefined : lastSuccessfulSurfaceId,
+							currentTeamState.orchestratorPaneId,
+							async () => {
+								currentTeamState.orchestratorPaneId = await cmuxGetPaneId();
+								return currentTeamState.orchestratorPaneId;
+							},
 						);
 
 						if (surfaceId) {
 							currentTeamState.surfaceIds[agent.name] = surfaceId;
-							lastSuccessfulSurfaceId = surfaceId;
 						}
 					}
 
@@ -1369,19 +1395,16 @@ export default function teamExtension(pi: ExtensionAPI) {
 					for (const agent of state.agents) {
 						const status = state.agentStatus[agent.name] ?? "idle";
 						const icon = statusIcon(status);
-						const surface = state.surfaceIds[agent.name] ? ` (pane: ${state.surfaceIds[agent.name]})` : "";
+						const surface = state.surfaceIds[agent.name] ? ` (surface: ${state.surfaceIds[agent.name]})` : "";
 						lines.push(`  ${icon} ${agent.name} — ${status}${surface}`);
 					}
 
 					// Reports
-					const rdir = reportsDir(ctx.cwd, taskName);
-					if (fs.existsSync(rdir)) {
-						const reportFiles = fs.readdirSync(rdir).filter((f) => f.endsWith(".md"));
-						if (reportFiles.length > 0) {
-							lines.push("\n📄 Reports:");
-							for (const rf of reportFiles) {
-								lines.push(`  ✅ ${rf}`);
-							}
+					const completedReports = state.dispatchHistory.filter(e => e.result);
+					if (completedReports.length > 0) {
+						lines.push("\n📄 Reports:");
+						for (const entry of completedReports) {
+							lines.push(`  ✅ ${entry.agent}`);
 						}
 					}
 
@@ -1434,7 +1457,7 @@ export default function teamExtension(pi: ExtensionAPI) {
 					}
 
 					// Re-dispatch the agent
-					const instructions = message || `Re-do your previous task. Review your earlier report and improve on it.`;
+					const instructions = message || `Re-do your previous task. Review your earlier work and improve on it.`;
 
 					state.agentStatus[agentName] = "working";
 					state.dispatchCount++;
@@ -1454,19 +1477,24 @@ export default function teamExtension(pi: ExtensionAPI) {
 						timestamp: Date.now(),
 					});
 
-					// Spawn agent if no surface exists (pane was closed, agent crashed, etc.)
+					// Spawn agent if no surface exists (surface was closed, agent crashed, etc.)
 					const existingSurfaceId = state.surfaceIds[agentName];
 					if (existingSurfaceId && !(await cmuxSurfaceExists(existingSurfaceId))) {
 						delete state.surfaceIds[agentName];
 					}
 					if (!state.surfaceIds[agentName]) {
-						const existingSurfaces = Object.values(state.surfaceIds);
-						const lastSurface = existingSurfaces.length > 0 ? existingSurfaces[existingSurfaces.length - 1] : undefined;
+						// Resolve orchestrator pane ID if not yet known
+						if (!state.orchestratorPaneId) {
+							state.orchestratorPaneId = await cmuxGetPaneId();
+						}
 
 						const { surfaceId } = await spawnAgent(
 							pi, ctx, rosterEntry, taskName,
-							existingSurfaces.length === 0 ? "right" : "down",
-							lastSurface,
+							state.orchestratorPaneId,
+							async () => {
+								state.orchestratorPaneId = await cmuxGetPaneId();
+								return state.orchestratorPaneId;
+							},
 						);
 
 						if (surfaceId) {
@@ -1508,7 +1536,7 @@ export default function teamExtension(pi: ExtensionAPI) {
 							});
 						}
 
-						// Close cmux panes
+						// Close cmux surfaces
 						for (const [agentName, surfaceId] of Object.entries(state.surfaceIds)) {
 							await cmuxCloseSurface(surfaceId);
 						}
@@ -1534,7 +1562,11 @@ export default function teamExtension(pi: ExtensionAPI) {
 					for (const agent of discovery.agents) {
 						const source = agent.source === "user" ? "👤" : "📁";
 						const model = agent.model ? ` [${agent.model}]` : "";
-						const tools = agent.tools ? ` (tools: ${agent.tools.join(", ")})` : "";
+						const tools = agent.tools
+							? agent.tools.includes("all")
+								? " (tools: all)"
+								: ` (tools: ${agent.tools.join(", ")})`
+							: "";
 						lines.push(`  ${source} ${agent.name}${model}${tools}`);
 						lines.push(`     ${agent.description}`);
 					}
@@ -1582,7 +1614,7 @@ export default function teamExtension(pi: ExtensionAPI) {
 				default: {
 					ctx.ui.notify(
 						"Unknown command. Usage:\n" +
-							"  /team init <team-name> <agent>...\n" +
+							"  /team init <team-name> [<agent>...]\n" +
 							"  /team status [team-name]\n" +
 							"  /team redo <team-name> <agent> [message]\n" +
 							"  /team shutdown [team-name]\n" +

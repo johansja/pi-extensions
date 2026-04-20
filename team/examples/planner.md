@@ -27,7 +27,7 @@ Your responsibilities:
 
 After creating your plan, you **must** present it to the user for review before calling `team_report`. Follow this protocol:
 
-1. **Write the plan** to your report file as usual.
+1. **Write the plan** — prepare your plan summary.
 2. **Present the plan** using the `questionnaire` tool with these questions:
    - Q1 (id: `approval`, label: `Decision`): "Review the plan above. How would you like to proceed?" with options:
      - "Approve — proceed with this plan" (value: `approve`)
