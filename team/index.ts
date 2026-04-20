@@ -3,27 +3,24 @@
  *
  * Compose a team from any agents discovered via .md files. The orchestrator
  * (the main pi session) uses LLM reasoning to decide which agent to dispatch
- * next, when to re-dispatch, and when the task is complete.
+ * next and when to re-dispatch.
  *
  * All worker communication routes through the orchestrator — workers never
  * talk to each other directly.
  *
  * Commands:
- *   /team init <task> <agent>...     — Create team, become orchestrator
- *   /team send [task] <details>      — Send task to orchestrator (task name optional if active)
- *   /team status [task]              — Show workflow state
- *   /team redo <task> <agent> [msg]  — Re-dispatch an agent (manual override)
- *   /team detach                     — Disable auto-routing of chat to team
- *   /team attach                     — Re-enable auto-routing of chat to team
- *   /team shutdown [task]            — Graceful shutdown of all workers
+ *   /team init <name> <agent>...     — Create team, become orchestrator
+ *   /team status [name]              — Show workflow state
+ *   /team redo <name> <agent> [msg]  — Re-dispatch an agent (manual override)
+ *   /team shutdown [name]            — Graceful shutdown of all workers
  *   /team list                       — List available agents
- *   /team history [task]             — Show dispatch history
+ *   /team history [name]             — Show dispatch history
  *
  * Tools (registered for LLM use):
- *   team_orchestrate  — Dispatch an agent or complete the task (orchestrator only)
- *   team_report       — Report task completion back to orchestrator (worker only)
+ *   team_orchestrate  — Dispatch an agent (orchestrator only)
+ *   team_report       — Report work completion back to orchestrator (worker only)
  *   team_message      — Send challenge/notify/ack to orchestrator (worker) or agent (orchestrator)
- *   team_read_deliverables — Read task description and all agent reports
+ *   team_read_deliverables — Read all agent reports
  */
 
 import * as fs from "node:fs";
@@ -68,16 +65,11 @@ interface TeamState {
 	task: string;
 	role: "orchestrator";
 	agents: AgentRosterEntry[];
-	agentStatus: Record<string, "idle" | "working" | "done">;
+	agentStatus: Record<string, "idle" | "working">;
 	surfaceIds: Record<string, string>;
-	taskDescription: string;
 	dispatchHistory: DispatchEntry[];
-	isComplete: boolean;
 	dispatchCount: number;
 	maxDispatches: number;
-	_autoRoute: boolean;
-	pendingTrigger: string | null;
-	pendingTriggerExtra: string | null;
 }
 
 interface WorkerState {
@@ -122,10 +114,6 @@ function reportPath(cwd: string, task: string, agent: string): string {
 	return path.join(reportsDir(cwd, task), `${agent}.md`);
 }
 
-function taskFilePath(cwd: string, task: string): string {
-	return path.join(workflowDir(cwd, task), "task.md");
-}
-
 // ─── State persistence ───────────────────────────────────────────────────────
 
 function saveState(cwd: string, state: TeamState): void {
@@ -138,12 +126,7 @@ function loadState(cwd: string, task: string): TeamState | null {
 	try {
 		const content = fs.readFileSync(sp, "utf-8").trim();
 		if (!content) return null;
-		const state = JSON.parse(content);
-		// Backward compat: default _autoRoute to true for state files that predate the field
-		if (state._autoRoute === undefined) {
-			state._autoRoute = true;
-		}
-		return state;
+		return JSON.parse(content) as TeamState;
 	} catch {
 		return null;
 	}
@@ -299,7 +282,6 @@ function terminalNotify(title: string, body: string): void {
 
 function statusIcon(status: string): string {
 	switch (status) {
-		case "done": return "✅";
 		case "working": return "🟡";
 		case "idle": return "🔵";
 		default: return "⚪";
@@ -309,24 +291,17 @@ function statusIcon(status: string): string {
 function updateTeamWidget(ctx: ExtensionContext, state: TeamState): void {
 	const lines: string[] = [];
 	lines.push(`🔷 Team: ${state.task}`);
-	lines.push(`   Task: ${state.taskDescription || "(pending)"}`);
 	lines.push("");
 
 	for (const agent of state.agents) {
 		const status = state.agentStatus[agent.name] ?? "idle";
 		const icon = statusIcon(status);
-		const lastReport = getLastReportSummary(agent.name, state);
-		const detail = status === "done" && lastReport ? ` — ${lastReport.substring(0, 60)}${lastReport.length > 60 ? "..." : ""}` : "";
-		lines.push(`   ${icon} ${agent.name} (${status})${detail}`);
+		lines.push(`   ${icon} ${agent.name} (${status})`);
 	}
 
 	const remaining = state.maxDispatches - state.dispatchCount;
 	lines.push("");
 	lines.push(`   Dispatches: ${state.dispatchCount}/${state.maxDispatches} (${remaining} remaining)`);
-
-	if (state.isComplete) {
-		lines.push("   ✅ Task complete");
-	}
 
 	ctx.ui.setWidget("team-dashboard", (tui, theme) => {
 		return new Text(lines.map(l => theme.fg("muted", l)).join("\n"), 0, 0);
@@ -406,12 +381,10 @@ function buildDelegationRules(agents: AgentRosterEntry[]): string[] {
 	return rules;
 }
 
-function buildOrchestratorContext(state: TeamState, triggerReason: string, extraInfo?: string): string {
+function buildOrchestratorContext(state: TeamState, extraInfo?: string): string {
 	const lines: string[] = [];
 
 	lines.push(`📋 **Team Orchestration — ${state.task}**`);
-	lines.push("");
-	lines.push(`**Task:** ${state.taskDescription}`);
 	lines.push("");
 
 	// Agent roster
@@ -419,14 +392,11 @@ function buildOrchestratorContext(state: TeamState, triggerReason: string, extra
 	for (const agent of state.agents) {
 		const status = state.agentStatus[agent.name] ?? "idle";
 		const icon = statusIcon(status);
-		// Show summary for done agents
-		const lastReport = getLastReportSummary(agent.name, state);
-		const statusDetail = status === "done" && lastReport ? ` — "${lastReport}"` : "";
-		lines.push(`  ${icon} ${agent.name} (${status})${statusDetail} — ${agent.description}`);
+		lines.push(`  ${icon} ${agent.name} (${status}) — ${agent.description}`);
 	}
 	lines.push("");
 
-	// Delegation rules — the key fix
+	// Delegation rules
 	const delegationRules = buildDelegationRules(state.agents);
 	if (delegationRules.length > 0) {
 		lines.push(...delegationRules);
@@ -444,51 +414,15 @@ function buildOrchestratorContext(state: TeamState, triggerReason: string, extra
 	lines.push(`**Dispatches:** ${state.dispatchCount}/${state.maxDispatches} used (${remaining} remaining)`);
 	lines.push("");
 
-	// Trigger reason
-	lines.push(`**Reason:** ${triggerReason}`);
-	lines.push("⚡ You were re-invoked because of the event above. Decide the next action — do not poll for updates.");
-	lines.push("");
-
-	if (state.isComplete) {
-		lines.push("The task is marked as complete. No further action needed.");
-	} else if (remaining <= 0) {
-		lines.push("⚠️ No dispatches remaining. Use /team send to provide more budget or /team shutdown to end.");
+	if (remaining <= 0) {
+		lines.push("⚠️ No dispatches remaining. Use /team shutdown to end.");
 	} else {
-		lines.push("Use the `team_orchestrate` tool to dispatch an agent, or mark the task complete.");
+		lines.push("Use the `team_orchestrate` tool to dispatch an agent.");
 	}
 
 	return lines.join("\n");
 }
 
-function getLastReportSummary(agentName: string, state: TeamState): string | null {
-	// Find the last dispatch entry for this agent that has a result
-	for (let i = state.dispatchHistory.length - 1; i >= 0; i--) {
-		if (state.dispatchHistory[i].agent === agentName && state.dispatchHistory[i].result) {
-			return state.dispatchHistory[i].result!;
-		}
-	}
-	return null;
-}
-
-// ─── Orchestrator trigger ────────────────────────────────────────────────────
-
-function triggerOrchestration(
-	pi: ExtensionAPI,
-	ctx: ExtensionContext,
-	state: TeamState,
-	reason: string,
-	extraInfo?: string,
-): void {
-	if (state.isComplete) return;
-
-	// Store the trigger info in state for before_agent_start to pick up
-	state.pendingTrigger = reason;
-	state.pendingTriggerExtra = extraInfo ?? null;
-	saveState(ctx.cwd, state);
-
-	// Send a minimal user message just to trigger the agent turn
-	pi.sendUserMessage(`🔄 Team update: ${reason}`, { deliverAs: "followUp" });
-}
 
 // ─── Agent spawn ─────────────────────────────────────────────────────────────
 
@@ -513,7 +447,6 @@ async function spawnAgent(
 		`- Workflow directory: \`.pi/workflow/${task}/\``,
 		`- Write your report to: \`.pi/workflow/${task}/reports/${agent.name}.md\``,
 		`- Your mailbox: \`.pi/workflow/${task}/mailbox/${agent.name}.json\``,
-		`- Task description: \`.pi/workflow/${task}/task.md\``,
 		`- Other agents' reports: \`.pi/workflow/${task}/reports/\``,
 		``,
 		`## Communication Protocol`,
@@ -528,7 +461,7 @@ async function spawnAgent(
 		`## Handoff Protocol`,
 		``,
 		`1. **Wait for dispatch** — Do not start work yet. The task instructions will arrive as a dispatch message from the orchestrator.`,
-		`2. **Read context** — Use \`team_read_deliverables\` to get the task description and any reports from prior agents.`,
+		`2. **Read context** — Use \`team_read_deliverables\` to get any reports from prior agents.`,
 		`3. **Do your work** — Execute your responsibilities as defined by your role.`,
 		`4. **Report completion** — Call \`team_report\` with a summary. Include questions if needed.`,
 		`5. **Wait** — After reporting, wait for further instructions from the orchestrator.`,
@@ -596,8 +529,8 @@ function processOrchestratorMailbox(
 					break;
 				}
 			}
-			// Update agent status
-			state.agentStatus[msg.from] = "done";
+			// Update agent status back to idle
+			state.agentStatus[msg.from] = "idle";
 			saveState(ctx.cwd, state);
 
 			parts.push(`**Agent "${msg.from}" completed:** ${msg.summary ?? "No summary provided"}`);
@@ -620,7 +553,9 @@ function processOrchestratorMailbox(
 	}
 
 	if (hasActionableMessage) {
-		const extraInfo = parts.join("\n\n");
+		updateTeamWidget(ctx, state);
+
+		// Send a user message to trigger the orchestrator's next turn
 		let reason = "Agent update";
 		if (messages.some(m => m.type === "done") && messages.some(m => m.type === "challenge")) {
 			reason = "Agent reported completion and raised a challenge";
@@ -631,7 +566,7 @@ function processOrchestratorMailbox(
 		} else if (messages.some(m => m.type === "notify")) {
 			reason = "Agent sent a notification";
 		}
-		triggerOrchestration(pi, ctx, state, reason, extraInfo);
+		pi.sendUserMessage(`🔄 Team update: ${reason}`, { deliverAs: "followUp" });
 	}
 }
 
@@ -747,32 +682,28 @@ export default function teamExtension(pi: ExtensionAPI) {
 		name: "team_orchestrate",
 		label: "Orchestrate Team",
 		description:
-			"Orchestrate the team by dispatching an agent with instructions or marking the task complete. " +
+			"Orchestrate the team by dispatching an agent with instructions. " +
 			"You are a PURE DELEGATOR — your ONLY job is to decide which agent to dispatch next and pass context. " +
 			"Never do work that a team agent specializes in (planning, reviewing, implementing, etc.). " +
 			"Only available when you are the orchestrator.",
-		promptSnippet: "Dispatch an agent or complete the team task",
+		promptSnippet: "Dispatch an agent with instructions",
 		promptGuidelines: [
 			"Always dispatch one agent at a time. After dispatching, STOP — do not use team_read_deliverables or read files to check on the agent. You will be automatically re-invoked when the agent reports back.",
 			"You are a PURE DELEGATOR. Your job is ONLY to decide which agent to dispatch next and provide them with clear instructions. Never do work that a team agent can do — if a planner exists, you do NOT plan; if a reviewer exists, you do NOT review; if a worker exists, you do NOT implement.",
 			"When an agent reports completion, briefly note their result and dispatch the next agent. Do NOT re-analyze, re-plan, or re-review their work yourself — delegate to the appropriate specialist.",
 			"If an agent raises a challenge or question, address it by dispatching the right agent to handle it. Do not attempt to solve the challenge yourself.",
-			"Use 'complete' action only when the overall task is fully accomplished.",
 			"You have a limited number of dispatches — use them wisely.",
 			"Give each agent clear, specific instructions about what you need them to do. Include relevant context from previous agents' reports.",
 		],
 		parameters: Type.Object({
-			action: StringEnum(["dispatch", "complete"] as const, {
-				description: "Action to take: 'dispatch' sends a task to an agent, 'complete' marks the overall task as done",
+			action: StringEnum(["dispatch"] as const, {
+				description: "Action to take: 'dispatch' sends a task to an agent",
 			}),
 			agent: Type.Optional(Type.String({
 				description: "Name of the agent to dispatch (required for 'dispatch' action)",
 			})),
 			instructions: Type.Optional(Type.String({
 				description: "Clear instructions for the agent (required for 'dispatch' action). Include relevant context from previous agents' work.",
-			})),
-			summary: Type.Optional(Type.String({
-				description: "Summary of what was accomplished overall (required for 'complete' action)",
 			})),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -798,13 +729,6 @@ export default function teamExtension(pi: ExtensionAPI) {
 			if (!state) {
 				return {
 					content: [{ type: "text", text: `No workflow state found for "${task}".` }],
-					isError: true,
-				};
-			}
-
-			if (state.isComplete) {
-				return {
-					content: [{ type: "text", text: "Task is already marked as complete." }],
 					isError: true,
 				};
 			}
@@ -847,7 +771,7 @@ export default function teamExtension(pi: ExtensionAPI) {
 				// Check dispatch budget
 				if (state.dispatchCount >= state.maxDispatches) {
 					return {
-						content: [{ type: "text", text: `Dispatch limit reached (${state.maxDispatches}). Use /team send to continue with a new budget.` }],
+						content: [{ type: "text", text: `Dispatch limit reached (${state.maxDispatches}). Use /team shutdown to end.` }],
 						isError: true,
 					};
 				}
@@ -901,47 +825,6 @@ export default function teamExtension(pi: ExtensionAPI) {
 					content: [{
 						type: "text",
 						text: `✅ Dispatched "${params.agent}" with instructions.\nDispatches: ${state.dispatchCount}/${state.maxDispatches} (${remaining} remaining)\n\n⏳ Wait for the agent to report back. You will be automatically re-invoked when they report back — do not poll or check for updates.`,
-					}],
-				};
-			}
-
-			if (params.action === "complete") {
-				if (!params.summary) {
-					return {
-						content: [{ type: "text", text: "Must provide a summary when completing the task." }],
-						isError: true,
-					};
-				}
-
-				state.isComplete = true;
-				state.dispatchHistory.push({
-					agent: "orchestrator",
-					instructions: `Task completed: ${params.summary}`,
-					timestamp: Date.now(),
-					result: params.summary,
-				});
-
-				saveState(ctx.cwd, state);
-				currentTeamState = state;
-
-				updateTeamWidget(ctx, state);
-
-				// Notify all agents
-				for (const agent of state.agents) {
-					const mp = mailboxPath(ctx.cwd, task, agent.name);
-					appendToMailbox(mp, {
-						type: "shutdown",
-						from: "orchestrator",
-						to: agent.name,
-						body: `Task "${task}" is complete: ${params.summary}`,
-						timestamp: Date.now(),
-					});
-				}
-
-				return {
-					content: [{
-						type: "text",
-						text: `✅ Task "${task}" marked as complete: ${params.summary}`,
 					}],
 				};
 			}
@@ -1023,7 +906,7 @@ export default function teamExtension(pi: ExtensionAPI) {
 			// Update state
 			const state = loadState(ctx.cwd, task);
 			if (state) {
-				state.agentStatus[role] = "done";
+				state.agentStatus[role] = "idle";
 				// Update dispatch history result
 				for (let i = state.dispatchHistory.length - 1; i >= 0; i--) {
 					if (state.dispatchHistory[i].agent === role && !state.dispatchHistory[i].result) {
@@ -1152,10 +1035,10 @@ export default function teamExtension(pi: ExtensionAPI) {
 		name: "team_read_deliverables",
 		label: "Read Team Deliverables",
 		description:
-			"Read the task description and all agent reports. Use at the start of your work to get " +
+			"Read all agent reports. Use at the start of your work to get " +
 			"context from previous agents, or when the orchestrator asks you to review what's been done. " +
 			"Do NOT use this to poll for agent progress after dispatching — you will be automatically re-invoked when agents report back.",
-		promptSnippet: "Read task description and agent reports",
+		promptSnippet: "Read agent reports",
 		parameters: Type.Object({}),
 		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
 			const task = process.env.PI_TEAM_TASK ?? currentWorkerState?.task ?? currentTeamState?.task;
@@ -1167,15 +1050,7 @@ export default function teamExtension(pi: ExtensionAPI) {
 				};
 			}
 
-			const dir = workflowDir(ctx.cwd, task);
 			const parts: string[] = [];
-
-			// Read task description
-			const tfp = taskFilePath(ctx.cwd, task);
-			if (fs.existsSync(tfp)) {
-				const content = fs.readFileSync(tfp, "utf-8");
-				parts.push(`## Task Description\n\n${content}`);
-			}
 
 			// Read all reports
 			const rdir = reportsDir(ctx.cwd, task);
@@ -1188,7 +1063,7 @@ export default function teamExtension(pi: ExtensionAPI) {
 			}
 
 			if (parts.length === 0) {
-				return { content: [{ type: "text", text: "No task description or reports found yet." }] };
+				return { content: [{ type: "text", text: "No reports found yet." }] };
 			}
 
 			return { content: [{ type: "text", text: parts.join("\n\n---\n\n") }] };
@@ -1332,17 +1207,12 @@ export default function teamExtension(pi: ExtensionAPI) {
 		const task = currentTeamState.task;
 
 		const state = loadState(ctx.cwd, task);
-		if (!state || !state.pendingTrigger) return;
+		if (!state) return;
 
-		// Build the full context for the system prompt
-		const context = buildOrchestratorContext(state, state.pendingTrigger, state.pendingTriggerExtra ?? undefined);
+		// Build and inject orchestrator context on every turn
+		const context = buildOrchestratorContext(state);
 
-		// Clear the pending trigger
-		state.pendingTrigger = null;
-		state.pendingTriggerExtra = null;
-		saveState(ctx.cwd, state);
 		currentTeamState = state;
-
 		updateTeamWidget(ctx, state);
 
 		return {
@@ -1350,51 +1220,12 @@ export default function teamExtension(pi: ExtensionAPI) {
 		};
 	});
 
-	// ─── Input interception: auto-route chat to active task ─────────────────
-
-	pi.on("input", async (event, ctx) => {
-		// Only intercept when we have an active, non-complete orchestrator task with autoRoute enabled
-		if (!currentTeamState || currentTeamState.isComplete || !currentTeamState._autoRoute) {
-			return; // Let input pass through normally
-		}
-
-		const text = event.text?.trim();
-		if (!text) return;
-
-		// Always pass through slash commands and bash commands
-		if (text.startsWith("/") || text.startsWith("!")) return;
-
-		// Only intercept interactive input (not from RPC/extensions)
-		if (event.source !== "interactive") return;
-
-		// Route this message to the orchestrator as a task update
-		const taskName = currentTeamState.task;
-		const state = loadState(ctx.cwd, taskName);
-		if (!state || state.isComplete) return;
-
-		currentTeamState = state;
-
-		// Pass the user's message as extraInfo so the orchestrator sees it
-		// without mutating the original task description
-		const extraInfo = `**User message:** ${text}`;
-
-		// Trigger orchestration with the user's text as context
-		triggerOrchestration(pi, ctx, state, "User message received", extraInfo);
-		updateTeamWidget(ctx, state);
-
-		// Show a notification so the user can see their message was routed
-		ctx.ui.notify(`📩 Routed to team: ${text.substring(0, 80)}${text.length > 80 ? "..." : ""}`, "info");
-
-		// Consume the input so pi doesn't also process it as a normal message
-		return { action: "handled" };
-	});
-
 	// ─── /team command ────────────────────────────────────────────────────
 
 	pi.registerCommand("team", {
 		description: "Manage dynamic multi-agent team workflows",
 		getArgumentCompletions: (prefix: string) => {
-			const subcommands = ["init", "send", "status", "redo", "detach", "attach", "shutdown", "list", "history"];
+			const subcommands = ["init", "status", "redo", "shutdown", "list", "history"];
 			return subcommands
 				.filter((s) => s.startsWith(prefix))
 				.map((s) => ({ value: s, label: s }));
@@ -1461,7 +1292,7 @@ export default function teamExtension(pi: ExtensionAPI) {
 					}
 
 					// Initialize state
-					const agentStatus: Record<string, "idle" | "working" | "done"> = {};
+					const agentStatus: Record<string, "idle" | "working"> = {};
 					for (const agent of roster) {
 						agentStatus[agent.name] = "idle";
 					}
@@ -1472,14 +1303,9 @@ export default function teamExtension(pi: ExtensionAPI) {
 						agents: roster,
 						agentStatus,
 						surfaceIds: {},
-						taskDescription: "",
 						dispatchHistory: [],
-						isComplete: false,
 						dispatchCount: 0,
 						maxDispatches: MAX_DISPATCHES,
-						_autoRoute: true,
-						pendingTrigger: null,
-						pendingTriggerExtra: null,
 					};
 					saveState(ctx.cwd, currentTeamState);
 					saveSessionState(pi, currentTeamState);
@@ -1517,60 +1343,8 @@ export default function teamExtension(pi: ExtensionAPI) {
 					await cmuxRenameTab(undefined, orchLabel);
 
 					const agentList = roster.map((a) => `  🔵 ${a.name} — ${a.description}`).join("\n");
-					ctx.ui.notify(`Team initialized for "${taskName}"\nAgents:\n${agentList}\n\nChat naturally or use /team send <task-details> to start. Use /team detach to disable auto-routing.`, "info");
+					ctx.ui.notify(`Team initialized for "${taskName}"\nAgents:\n${agentList}\n\nDispatch agents using team_orchestrate or use /team redo to re-dispatch.`, "info");
 					await cmuxLog("info", `Team initialized for ${taskName} with agents: ${roster.map((a) => a.name).join(", ")}`);
-					break;
-				}
-
-				// ─── /team send ─────────────────────────────────────────
-				case "send": {
-					// Heuristic: if parts[1] is an existing workflow directory, use old 2-arg form
-					let taskName: string;
-					let taskDetails: string;
-
-					if (parts[1] && fs.existsSync(workflowDir(ctx.cwd, parts[1]))) {
-						// Old form: /team send <task-name> <task-details>
-						taskName = parts[1];
-						taskDetails = parts.slice(2).join(" ");
-					} else if (currentTeamState) {
-						// Simplified form: /team send <task-details> (uses active task)
-						taskName = currentTeamState.task;
-						taskDetails = parts.slice(1).join(" ");
-					} else {
-						ctx.ui.notify("Usage: /team send <task-details> (or /team send <task-name> <task-details> if no active task)", "warning");
-						return;
-					}
-
-					if (!taskDetails) {
-						ctx.ui.notify("Usage: /team send <task-details>", "warning");
-						return;
-					}
-
-					const state = currentTeamState ?? loadState(ctx.cwd, taskName);
-					if (!state) {
-						ctx.ui.notify(`No workflow found for "${taskName}". Run /team init first.`, "warning");
-						return;
-					}
-
-					if (state.isComplete) {
-						ctx.ui.notify(`Task "${taskName}" is already complete.`, "warning");
-						return;
-					}
-
-					// Update task description
-					state.taskDescription = taskDetails;
-					saveState(ctx.cwd, state);
-					currentTeamState = state;
-
-					// Write task.md
-					const tfp = taskFilePath(ctx.cwd, taskName);
-					fs.writeFileSync(tfp, taskDetails, { encoding: "utf-8" });
-
-					// Trigger orchestration
-					triggerOrchestration(pi, ctx, state, "New task from user");
-					updateTeamWidget(ctx, state);
-					ctx.ui.notify(`Task sent to orchestrator for "${taskName}"`, "info");
-					await cmuxLog("info", `Task sent for ${taskName}: ${taskDetails.substring(0, 100)}...`);
 					break;
 				}
 
@@ -1589,20 +1363,14 @@ export default function teamExtension(pi: ExtensionAPI) {
 						return;
 					}
 
-					const lines: string[] = [`📋 Workflow: ${taskName}`];
-
-					if (state.taskDescription) {
-						lines.push(`\n📝 Task: ${state.taskDescription}`);
-					}
+					const lines: string[] = [`📋 Team: ${taskName}`];
 
 					lines.push("\n👥 Agents:");
 					for (const agent of state.agents) {
 						const status = state.agentStatus[agent.name] ?? "idle";
 						const icon = statusIcon(status);
 						const surface = state.surfaceIds[agent.name] ? ` (pane: ${state.surfaceIds[agent.name]})` : "";
-						const lastResult = getLastReportSummary(agent.name, state);
-						const resultLine = status === "done" && lastResult ? `\n     Last: ${lastResult.substring(0, 80)}${lastResult.length > 80 ? "..." : ""}` : "";
-						lines.push(`  ${icon} ${agent.name} — ${status}${surface}${resultLine}`);
+						lines.push(`  ${icon} ${agent.name} — ${status}${surface}`);
 					}
 
 					// Reports
@@ -1631,8 +1399,7 @@ export default function teamExtension(pi: ExtensionAPI) {
 						}
 					}
 
-					lines.push(`\n🔄 Complete: ${state.isComplete ? "Yes ✅" : "No"}`);
-					lines.push(`📊 Dispatches: ${state.dispatchCount}/${state.maxDispatches}`);
+					lines.push(`\n📊 Dispatches: ${state.dispatchCount}/${state.maxDispatches}`);
 
 					ctx.ui.notify(lines.join("\n"), "info");
 					break;
@@ -1746,7 +1513,6 @@ export default function teamExtension(pi: ExtensionAPI) {
 							await cmuxCloseSurface(surfaceId);
 						}
 
-						state.isComplete = true;
 						saveState(ctx.cwd, state);
 					}
 
@@ -1813,46 +1579,15 @@ export default function teamExtension(pi: ExtensionAPI) {
 					break;
 				}
 
-				// ─── /team detach ─────────────────────────────────────
-				case "detach": {
-					if (!currentTeamState) {
-						ctx.ui.notify("No active team session.", "warning");
-						return;
-					}
-					currentTeamState._autoRoute = false;
-					saveState(ctx.cwd, currentTeamState);
-					ctx.ui.notify("🔇 Auto-route detached. Your messages will no longer be sent to the team automatically. Use /team attach to re-enable.", "info");
-					break;
-				}
-
-				// ─── /team attach ─────────────────────────────────────
-				case "attach": {
-					if (!currentTeamState) {
-						ctx.ui.notify("No active team session.", "warning");
-						return;
-					}
-					if (currentTeamState.isComplete) {
-						ctx.ui.notify("Task is already complete. Auto-routing has no effect.", "warning");
-						return;
-					}
-					currentTeamState._autoRoute = true;
-					saveState(ctx.cwd, currentTeamState);
-					ctx.ui.notify("🔊 Auto-route attached. Your messages will be sent to the team automatically. Use /team detach to disable.", "info");
-					break;
-				}
-
 				default: {
 					ctx.ui.notify(
 						"Unknown command. Usage:\n" +
-							"  /team init <task-name> <agent>...\n" +
-							"  /team send [task] <task-details>\n" +
-							"  /team status [task-name]\n" +
-							"  /team redo <task-name> <agent> [message]\n" +
-							"  /team detach\n" +
-							"  /team attach\n" +
-							"  /team shutdown [task-name]\n" +
+							"  /team init <team-name> <agent>...\n" +
+							"  /team status [team-name]\n" +
+							"  /team redo <team-name> <agent> [message]\n" +
+							"  /team shutdown [team-name]\n" +
 							"  /team list\n" +
-							"  /team history [task-name]",
+							"  /team history [team-name]",
 						"info",
 					);
 				}
