@@ -59,8 +59,6 @@ const CONFIG = {
 	PENDING_RESUME_EXPIRY_MS: 5 * 60 * 1000,
 	CMUX_TIMEOUT_MS: 10000,
 	MAX_CONTEXT_DISPATCHES: 20,
-	MAX_RESULT_SNIPPET_LENGTH: 100,
-	MAX_INSTRUCTION_SNIPPET_LENGTH: 120,
 	TASK_NAME_MAX_LENGTH: 64,
 } as const;
 
@@ -254,28 +252,25 @@ function loadWorkerState(ctx: ExtensionContext): WorkerState | null {
 
 // ─── Mailbox helpers ─────────────────────────────────────────────────────────
 
-function readMailbox(filePath: string, ctx?: ExtensionContext): TeamMessage[] {
+function readMailbox(filePath: string, _ctx?: ExtensionContext): TeamMessage[] {
 	try {
-		const content = fs.readFileSync(filePath, "utf-8").trim();
-		if (!content) return [];
-		const lines = content.split("\n").filter(Boolean);
+		const content = fs.readFileSync(filePath, "utf-8");
+		if (!content.trim()) return [];
+		const lines = content.split("\n");
 		const messages: TeamMessage[] = [];
 		for (const line of lines) {
 			if (!line.trim()) continue;
 			try {
 				messages.push(JSON.parse(line) as TeamMessage);
 			} catch (e) {
-				const logMsg = `team: malformed mailbox line: ${line}`;
-				if (ctx) {
-					cmuxLog("warn", logMsg).catch(() => {});
-				} else {
-					// eslint-disable-next-line no-console
-					console.error(logMsg);
-				}
+				safeLog("warn", `team: malformed mailbox line in ${filePath}: ${line.substring(0, 100)}`);
 			}
 		}
 		return messages;
-	} catch {
+	} catch (e: any) {
+		if (e.code !== "ENOENT") {
+			safeLog("warn", `team: failed to read mailbox ${filePath}: ${e.message}`);
+		}
 		return [];
 	}
 }
@@ -501,7 +496,7 @@ function buildResumeContext(state: TeamState): string {
 	if (completedDispatches.length > 0) {
 		lines.push("**Completed work (these agents already have results — do not re-dispatch them for the same task):**");
 		for (const d of completedDispatches) {
-			lines.push(`  ✅ ${d.agent}: ${(d.result ?? "").substring(0, CONFIG.MAX_INSTRUCTION_SNIPPET_LENGTH)}${(d.result ?? "").length > CONFIG.MAX_INSTRUCTION_SNIPPET_LENGTH ? "..." : ""}`);
+			lines.push(`  ✅ ${d.agent}: ${d.result ?? "No result"}`);
 		}
 		lines.push("");
 	}
@@ -509,7 +504,7 @@ function buildResumeContext(state: TeamState): string {
 	if (interruptedDispatches.length > 0) {
 		lines.push("**Interrupted tasks (these agents were working when the session ended and their work was not completed):**");
 		for (const d of interruptedDispatches) {
-			lines.push(`  ⚠️ ${d.agent}: ${(d.instructions ?? "").substring(0, CONFIG.MAX_INSTRUCTION_SNIPPET_LENGTH)}${(d.instructions ?? "").length > CONFIG.MAX_INSTRUCTION_SNIPPET_LENGTH ? "..." : ""}`);
+			lines.push(`  ⚠️ ${d.agent}: ${d.instructions ?? "No instructions"}`);
 		}
 		lines.push("");
 	}
@@ -820,7 +815,7 @@ function buildOrchestratorContext(state: TeamState, extraInfo?: string): string 
 	}
 	if (agentsWithResults.size > 0) {
 		for (const [agentName, results] of agentsWithResults) {
-			const summary = results.map((r, i) => `#${i + 1}: ${r.substring(0, CONFIG.MAX_RESULT_SNIPPET_LENGTH)}${r.length > CONFIG.MAX_RESULT_SNIPPET_LENGTH ? "..." : ""}`).join("; ");
+			const summary = results.map((r, i) => `#${i + 1}: ${r}`).join("; ");
 			lines.push(`- ${agentName}: ${summary}`);
 		}
 	} else {
@@ -999,8 +994,8 @@ function processOrchestratorMailbox(
 				}
 				saveState(ctx.cwd, state);
 
-				const resultPreview = (report.result ?? "No result provided").substring(0, 200);
-				parts.push(`Agent "${msg.from}" completed: ${resultPreview}`);
+				const fullResult = report.result ?? "No result provided";
+				parts.push(`Agent "${msg.from}" completed:\n\n${fullResult}`);
 			}
 		} else if (msg.type === "shutdown") {
 			// Orchestrator receiving a shutdown notice (rare — mostly agent→orchestrator)
@@ -1073,6 +1068,7 @@ function setupMailboxWatching(
 				processWorkerMailbox(pi, ctx, task, role, messages);
 			}
 			clearMailbox(mp);
+			lastSize = 0; // Reset after truncation so new messages of any size are detected
 		} catch {
 			// Mailbox file might be temporarily unavailable
 		} finally {
@@ -2031,9 +2027,9 @@ export default function teamExtension(pi: ExtensionAPI) {
 							const time = new Date(entry.timestamp).toLocaleTimeString();
 							const resultIcon = entry.result ? "✅" : "🟡";
 							lines.push(`${i + 1}. ${resultIcon} ${entry.agent} — ${time}`);
-							lines.push(`   Instructions: ${entry.instructions.substring(0, CONFIG.MAX_RESULT_SNIPPET_LENGTH)}${entry.instructions.length > CONFIG.MAX_RESULT_SNIPPET_LENGTH ? "..." : ""}`);
+							lines.push(`   Instructions: ${entry.instructions}`);
 							if (entry.result) {
-								lines.push(`   Result: ${entry.result.substring(0, CONFIG.MAX_RESULT_SNIPPET_LENGTH)}${entry.result.length > CONFIG.MAX_RESULT_SNIPPET_LENGTH ? "..." : ""}`);
+								lines.push(`   Result: ${entry.result}`);
 							}
 						}
 					}
