@@ -19,8 +19,6 @@
  *
  * Tools (registered for LLM use):
  *   team_orchestrate  — Dispatch an agent (orchestrator only)
- *   team_report       — Report work completion back to orchestrator (worker only)
- *   team_message      — Send challenge/notify/ack to orchestrator (worker) or agent (orchestrator)
  */
 
 import * as crypto from "node:crypto";
@@ -77,6 +75,7 @@ interface DispatchEntry {
 	instructions: string;
 	timestamp: number;
 	result?: string;
+	stopReason?: string;
 	questions?: string[];
 	dispatchId: string;
 }
@@ -101,13 +100,11 @@ interface WorkerState {
 }
 
 interface TeamMessage {
-	type: "dispatch" | "challenge" | "done" | "notify" | "ack" | "shutdown";
+	type: "dispatch" | "message" | "shutdown";
 	from: string;
 	to: string;
-	body?: string;          // challenge/notify/ack/shutdown message content
+	body?: string;          // message content
 	instructions?: string;  // dispatch instructions
-	summary?: string;       // done report summary
-	questions?: string[];   // done report questions
 	timestamp: number;
 	dispatchId?: string;
 }
@@ -314,6 +311,30 @@ function clearMailbox(filePath: string): void {
 	} catch (e) {
 		safeLog("warn", `team: failed to clear mailbox ${filePath}: ${e}`);
 	}
+}
+
+// ─── Message extraction helpers ─────────────────────────────────────────────
+
+function findLastAssistantMessage(messages: any[]): any {
+	for (let i = messages.length - 1; i >= 0; i--) {
+		if (messages[i].role === "assistant") {
+			return messages[i];
+		}
+	}
+	return null;
+}
+
+function extractAgentResult(messages: any[]): string {
+	const assistant = findLastAssistantMessage(messages);
+	if (!assistant) return "[No assistant message found]";
+
+	const texts: string[] = [];
+	for (const part of assistant.content || []) {
+		if (part.type === "text") {
+			texts.push(part.text);
+		}
+	}
+	return texts.join("\n") || "[Empty assistant message]";
 }
 
 // ─── cmux CLI helpers ────────────────────────────────────────────────────────
@@ -585,15 +606,20 @@ async function resumeTeam(pi: ExtensionAPI, ctx: ExtensionContext, taskName: str
 	try {
 		const orchMessages = readMailbox(orchMp, ctx);
 		for (const msg of orchMessages) {
-			if (msg.type === "done" && msg.summary) {
-				for (let i = state.dispatchHistory.length - 1; i >= 0; i--) {
-					const entry = state.dispatchHistory[i];
-					if (entry.agent === msg.from && (!entry.result || entry.result === "[Session interrupted]")) {
-						entry.result = msg.summary;
-						if (msg.questions && msg.questions.length > 0) {
-							entry.questions = msg.questions;
+			if (msg.type === "message" && msg.body) {
+				let report: { type?: string; result?: string } | null = null;
+				try {
+					report = JSON.parse(msg.body);
+				} catch {
+					// Not structured — skip for salvage
+				}
+				if (report?.type === "report" && report.result) {
+					for (let i = state.dispatchHistory.length - 1; i >= 0; i--) {
+						const entry = state.dispatchHistory[i];
+						if (entry.agent === msg.from && (!entry.result || entry.result === "[Session interrupted]")) {
+							entry.result = report.result;
+							break;
 						}
-						break;
 					}
 				}
 			}
@@ -802,6 +828,16 @@ function buildOrchestratorContext(state: TeamState, extraInfo?: string): string 
 	}
 	lines.push("");
 
+	// Show stop reasons for recent dispatches
+	const stopsWithReasons = recentDispatches
+		.filter(d => d.result && d.stopReason)
+		.map(d => `  - ${d.agent}: ${d.result?.substring(0, 60) ?? ""} (stop: ${d.stopReason})`);
+	if (stopsWithReasons.length > 0) {
+		lines.push("**Stop reasons:**");
+		lines.push(...stopsWithReasons);
+		lines.push("");
+	}
+
 	// Extra info (e.g., challenge details)
 	if (extraInfo) {
 		lines.push(extraInfo);
@@ -845,16 +881,13 @@ async function spawnAgent(
 			``,
 			`All communication routes through the orchestrator — you never talk directly to other agents.`,
 			``,
-			`- **Reporting completion**: Call \`team_report\` with a clear summary of what you accomplished. Include questions in the \`questions\` parameter if you need clarification or decisions from the orchestrator.`,
-			`- **Challenging instructions**: Use \`team_message\` with type \`challenge\` if you think instructions are unreasonable, can be simplified, or improved. Address to "orchestrator".`,
-			`- **Notifications**: Use \`team_message\` with type \`notify\` for informational updates the orchestrator should know about.`,
-			`- **Acknowledgments**: Use \`team_message\` with type \`ack\` to acknowledge receipt of a message.`,
+			`- **Communication**: All communication routes through the orchestrator.`,
 			``,
 			`## Handoff Protocol`,
 			``,
 			`1. **Wait for dispatch** — Do not start work yet. The task instructions will arrive as a dispatch message from the orchestrator.`,
 			`2. **Do your work** — Execute your responsibilities as defined by your role.`,
-			`3. **Report completion** — Call \`team_report\` with a summary. Include questions if needed.`,
+			`3. **Report completion** — Your final response will be automatically sent to the orchestrator. Include a clear summary of your work.`,
 			`4. **Wait** — After reporting, wait for further instructions from the orchestrator.`,
 		].join("\n");
 		await fs.promises.writeFile(contextFile, contextContent, { encoding: "utf-8", mode: 0o600 });
@@ -930,53 +963,51 @@ function processOrchestratorMailbox(
 	let hasActionableMessage = false;
 
 	for (const msg of messages) {
-		if (msg.type === "done") {
+		if (msg.type === "message") {
 			hasActionableMessage = true;
-			// Update dispatch history with result and questions
-			let matched = false;
-			if (msg.dispatchId) {
-				for (let i = state.dispatchHistory.length - 1; i >= 0; i--) {
-					if (state.dispatchHistory[i].dispatchId === msg.dispatchId) {
-						state.dispatchHistory[i].result = msg.summary ?? "";
-						if (msg.questions && msg.questions.length > 0) {
-							state.dispatchHistory[i].questions = msg.questions;
-						}
-						matched = true;
-						break;
-					}
-				}
-			}
-			if (!matched) {
-				for (let i = state.dispatchHistory.length - 1; i >= 0; i--) {
-					if (state.dispatchHistory[i].agent === msg.from && !state.dispatchHistory[i].result) {
-						state.dispatchHistory[i].result = msg.summary ?? "";
-						if (msg.questions && msg.questions.length > 0) {
-							state.dispatchHistory[i].questions = msg.questions;
-						}
-						break;
-					}
-				}
-			}
-			// Update agent status back to idle
 			state.agentStatus[msg.from] = "idle";
 			saveState(ctx.cwd, state);
 
-			parts.push(`**Agent "${msg.from}" completed:** ${msg.summary ?? "No summary provided"}`);
-			if (msg.questions && msg.questions.length > 0) {
-				parts.push(`**Questions from ${msg.from}:**`);
-				for (const q of msg.questions) {
-					parts.push(`  - ${q}`);
+			// Try to parse as a structured report
+			let report: { type: string; result?: string; stopReason?: string } | null = null;
+			if (msg.body) {
+				try {
+					report = JSON.parse(msg.body);
+				} catch {
+					// Not a structured message — treat body as plain text
 				}
 			}
-		} else if (msg.type === "challenge") {
-			hasActionableMessage = true;
-			parts.push(`**⚠️ Challenge from "${msg.from}":** ${msg.body ?? ""}`);
-		} else if (msg.type === "notify") {
-			// Notifies don't always need to trigger a turn, but include them
-			parts.push(`**📢 ${msg.from} notifies:** ${msg.body ?? ""}`);
-			hasActionableMessage = true; // Still trigger so orchestrator is aware
-		} else if (msg.type === "ack") {
-			parts.push(`**✅ ${msg.from} acknowledged:** ${msg.body ?? ""}`);
+
+			if (report?.type === "report") {
+				// Update dispatch history if we can match by dispatchId
+				if (msg.dispatchId) {
+					for (let i = state.dispatchHistory.length - 1; i >= 0; i--) {
+						if (state.dispatchHistory[i].dispatchId === msg.dispatchId) {
+							state.dispatchHistory[i].result = report.result ?? "";
+							state.dispatchHistory[i].stopReason = report.stopReason ?? "unknown";
+							break;
+						}
+					}
+				} else {
+					for (let i = state.dispatchHistory.length - 1; i >= 0; i--) {
+						if (state.dispatchHistory[i].agent === msg.from && !state.dispatchHistory[i].result) {
+							state.dispatchHistory[i].result = report.result ?? "";
+							state.dispatchHistory[i].stopReason = report.stopReason ?? "unknown";
+							break;
+						}
+					}
+				}
+				saveState(ctx.cwd, state);
+
+				const stopReason = report.stopReason ?? "unknown";
+				const resultPreview = (report.result ?? "No result provided").substring(0, 200);
+				parts.push(`**Agent "${msg.from}" ended (${stopReason}):** ${resultPreview}`);
+			}
+		} else if (msg.type === "shutdown") {
+			// Orchestrator receiving a shutdown notice (rare — mostly agent→orchestrator)
+			state.agentStatus[msg.from] = "idle";
+			saveState(ctx.cwd, state);
+			parts.push(`**🔴 ${msg.from} shut down.**`);
 		}
 	}
 
@@ -985,14 +1016,8 @@ function processOrchestratorMailbox(
 
 		// Send a user message to trigger the orchestrator's next turn
 		let reason = "Agent update";
-		if (messages.some(m => m.type === "done") && messages.some(m => m.type === "challenge")) {
-			reason = "Agent reported completion and raised a challenge";
-		} else if (messages.some(m => m.type === "done")) {
-			reason = "Agent reported completion";
-		} else if (messages.some(m => m.type === "challenge")) {
-			reason = "Agent raised a challenge";
-		} else if (messages.some(m => m.type === "notify")) {
-			reason = "Agent sent a notification";
+		if (messages.some(m => m.type === "message")) {
+			reason = "Agent sent a message";
 		}
 		const fullMessage = parts.length > 0
 			? `🔄 Team update: ${reason}\n\n${parts.join("\n\n")}`
@@ -1016,10 +1041,6 @@ function processWorkerMailbox(
 			pi.sendUserMessage(msg.instructions ?? msg.body ?? "New task from orchestrator", { deliverAs: "followUp" });
 		} else if (msg.type === "shutdown") {
 			ctx.ui.notify("🛑 Shutdown requested by orchestrator. Wrapping up.", "info");
-		} else if (msg.type === "notify") {
-			ctx.ui.notify(`📢 ${msg.from}: ${msg.body}`, "info");
-		} else if (msg.type === "ack") {
-			pi.sendUserMessage(`✅ ${msg.from} acknowledged: ${msg.body}`, { deliverAs: "followUp" });
 		}
 	}
 }
@@ -1144,10 +1165,9 @@ export default function teamExtension(pi: ExtensionAPI) {
 			"Only available when you are the orchestrator.",
 		promptSnippet: "Dispatch an agent with instructions",
 		promptGuidelines: [
-			"Always dispatch one agent at a time. After dispatching, STOP and wait. You will be automatically re-invoked when the agent reports back via team_report.",
+			"Always dispatch one agent at a time. After dispatching, STOP and wait. You will be automatically re-invoked when the agent ends their session — do not poll or check for updates.",
 			"You are a PURE DELEGATOR. Your job is ONLY to decide which agent to dispatch next and provide them with clear instructions. Never do work that a team agent can do — if a planner exists, you do NOT plan; if a reviewer exists, you do NOT review; if a worker exists, you do NOT implement.",
 			"When an agent reports completion, briefly note their result and dispatch the next agent. Do NOT re-analyze, re-plan, or re-review their work yourself — delegate to the appropriate specialist.",
-			"If an agent raises a challenge or question, address it by dispatching the right agent to handle it. Do not attempt to solve the challenge yourself.",
 			"Give each agent clear, specific instructions about what you need them to do. Include relevant context from previous agents' reports.",
 		],
 		parameters: Type.Object({
@@ -1211,7 +1231,7 @@ export default function teamExtension(pi: ExtensionAPI) {
 
 				if (state.agentStatus[params.agent] === "working") {
 					return {
-						content: [{ type: "text", text: `Agent "${params.agent}" is already working. Wait for them to report back.` }],
+						content: [{ type: "text", text: `Agent "${params.agent}" is already working. Wait for them to finish first.` }],
 						isError: true,
 					};
 				}
@@ -1278,7 +1298,7 @@ export default function teamExtension(pi: ExtensionAPI) {
 				return {
 					content: [{
 						type: "text",
-						text: `✅ Dispatched "${params.agent}" with instructions.\n\n⏳ Wait for the agent to report back. You will be automatically re-invoked when they report back — do not poll or check for updates.`,
+						text: `✅ Dispatched "${params.agent}" with instructions.\n\n⏳ Wait for the agent to finish their work. You will be automatically re-invoked when they end their session — do not poll or check for updates.`,
 					}],
 				};
 			}
@@ -1306,217 +1326,6 @@ export default function teamExtension(pi: ExtensionAPI) {
 			return new Text(text, 0, 0);
 		},
 	});
-
-	// ─── team_report tool (worker only) ───────────────────────────────────
-
-	pi.registerTool({
-		name: "team_report",
-		label: "Report Task Completion",
-		description:
-			"Report that you have completed your assigned work. Call this when you're done with the task " +
-			"given to you by the orchestrator. Your summary will be sent to the orchestrator who will " +
-			"decide the next step. You can also include questions for the orchestrator.",
-		promptSnippet: "Report task completion to orchestrator",
-		promptGuidelines: [
-			"Call this when you have finished the task given to you by the orchestrator.",
-			"Provide a clear, concise summary of what you accomplished.",
-			"Include questions if you need clarification or decisions from the orchestrator.",
-			"After calling this, wait for further instructions from the orchestrator.",
-		],
-		parameters: Type.Object({
-			summary: Type.String({
-				description: "Clear summary of what you accomplished",
-			}),
-			questions: Type.Optional(Type.Array(Type.String(), {
-				description: "Questions for the orchestrator (e.g., clarifications, decisions needed)",
-			})),
-		}),
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			const task = process.env.PI_TEAM_TASK ?? currentWorkerState?.task;
-			const role = process.env.PI_TEAM_ROLE ?? currentWorkerState?.role;
-
-			if (!task || !role) {
-				return {
-					content: [{ type: "text", text: "Not in a team session. Use /team commands to set up." }],
-					isError: true,
-				};
-			}
-
-			// Update state
-			const state = loadState(ctx.cwd, task);
-			const dispatchId = activeDispatches.get(`${task}/${role}`);
-			if (state) {
-				state.agentStatus[role] = "idle";
-				// Update dispatch history result and questions
-				let matched = false;
-				if (dispatchId) {
-					for (let i = state.dispatchHistory.length - 1; i >= 0; i--) {
-						if (state.dispatchHistory[i].dispatchId === dispatchId) {
-							state.dispatchHistory[i].result = params.summary;
-							if (params.questions && params.questions.length > 0) {
-								state.dispatchHistory[i].questions = params.questions;
-							}
-							matched = true;
-							break;
-						}
-					}
-				}
-				if (!matched) {
-					for (let i = state.dispatchHistory.length - 1; i >= 0; i--) {
-						if (state.dispatchHistory[i].agent === role && !state.dispatchHistory[i].result) {
-							state.dispatchHistory[i].result = params.summary;
-							if (params.questions && params.questions.length > 0) {
-								state.dispatchHistory[i].questions = params.questions;
-							}
-							break;
-						}
-					}
-				}
-				saveState(ctx.cwd, state);
-			}
-
-			// Send done message to orchestrator mailbox
-			const orchestratorMailbox = mailboxPath(ctx.cwd, task, "orchestrator");
-			appendToMailbox(orchestratorMailbox, {
-				type: "done",
-				from: role,
-				to: "orchestrator",
-				summary: params.summary,
-				questions: params.questions,
-				timestamp: Date.now(),
-				dispatchId,
-			});
-
-			// Notify
-			terminalNotify("Pi", `${role} done for ${task}`);
-			try {
-				await cmuxNotify("Pi", `${role} done for ${task}`);
-			} catch {
-				// cmux not available
-			}
-
-			return {
-				content: [{
-					type: "text",
-					text: "✅ Report submitted. Wait for further instructions from the orchestrator.",
-				}],
-			};
-		},
-		renderCall(args, theme, context) {
-			const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
-			text.setText(theme.fg("toolTitle", theme.bold("team_report ")) + theme.fg("muted", args.summary.substring(0, 60) + (args.summary.length > 60 ? "..." : "")));
-			return text;
-		},
-		renderResult(result, { expanded }, theme, context) {
-			const text = result.isError
-				? theme.fg("error", "✗ Report failed")
-				: theme.fg("success", "✓ Report submitted");
-			return new Text(text, 0, 0);
-		},
-	});
-
-	pi.registerTool({
-		name: "team_message",
-		label: "Team Message",
-		description:
-			"Send a message to the orchestrator (for workers) or to an agent (for orchestrator). " +
-			"Use 'challenge' to raise a concern or disagreement, 'notify' for informational updates, " +
-			"or 'ack' to acknowledge receipt of a message.",
-		promptSnippet: "Send a message to the orchestrator",
-		parameters: Type.Object({
-			to: Type.String({
-				description: "Recipient name (workers: use 'orchestrator'; orchestrator: use an agent name from your team, or '*' / 'all' to broadcast to every agent)",
-			}),
-			type: StringEnum(["challenge", "notify", "ack"] as const, {
-				description: "Type of message: challenge (disagreement/concern), notify (informational), or ack (acknowledge receipt/action)",
-			}),
-			body: Type.String({ description: "Message content" }),
-		}),
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			const task = process.env.PI_TEAM_TASK ?? currentWorkerState?.task ?? currentTeamState?.task;
-			const role = process.env.PI_TEAM_ROLE ?? currentWorkerState?.role ?? "orchestrator";
-
-			if (!task || !role) {
-				return {
-					content: [{ type: "text", text: "Not in a team session." }],
-					isError: true,
-				};
-			}
-
-			const state = loadState(ctx.cwd, task);
-			if (!state) {
-				return {
-					content: [{ type: "text", text: "No workflow state found." }],
-					isError: true,
-				};
-			}
-
-			// Validate recipient
-			const isBroadcast = params.to === "*" || params.to === "all";
-
-			if (role !== "orchestrator" && params.to !== "orchestrator" && !isBroadcast) {
-				return {
-					content: [{ type: "text", text: "Workers can only send messages to the orchestrator. Set 'to' to 'orchestrator'." }],
-					isError: true,
-				};
-			}
-
-			if (role === "orchestrator" && !isBroadcast) {
-				const agentExists = state.agents.some((a) => a.name === params.to);
-				if (!agentExists) {
-					return {
-						content: [{ type: "text", text: `Unknown agent "${params.to}". Available: ${state.agents.map((a) => a.name).join(", ")}` }],
-						isError: true,
-					};
-				}
-			}
-
-			if (isBroadcast && role === "orchestrator") {
-				// Broadcast to all agents
-				for (const agent of state.agents) {
-					const mp = mailboxPath(ctx.cwd, task, agent.name);
-					appendToMailbox(mp, {
-						type: params.type,
-						from: role,
-						to: agent.name,
-						body: params.body,
-						timestamp: Date.now(),
-					});
-				}
-				return {
-					content: [{ type: "text", text: `✉️ Broadcast ${params.type} to all ${state.agents.length} agents` }],
-				};
-			}
-
-			const mp = mailboxPath(ctx.cwd, task, params.to);
-			appendToMailbox(mp, {
-				type: params.type,
-				from: role,
-				to: params.to,
-				body: params.body,
-				timestamp: Date.now(),
-			});
-
-			return {
-				content: [{ type: "text", text: `✉️ ${params.type} sent to ${params.to}` }],
-			};
-		},
-		renderCall(args, theme, context) {
-			const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
-			const typeIcons: Record<string, string> = { challenge: "⚠️", notify: "📢", ack: "✅" };
-			const isBroadcast = args.to === "*" || args.to === "all";
-			if (isBroadcast) {
-				text.setText(theme.fg("toolTitle", theme.bold("team_message ")) + `📢 ${args.type} → all`);
-			} else {
-				text.setText(theme.fg("toolTitle", theme.bold("team_message ")) + `${typeIcons[args.type] ?? ""} ${args.type} → ${args.to}`);
-			}
-			return text;
-		},
-			renderResult(result, { expanded }, theme, context) {
-			return new Text(result.isError ? theme.fg("error", "✗ Failed") : theme.fg("success", "✓ Sent"), 0, 0);
-		},
-	});
-
 
 	// ─── Session start: restore state ─────────────────────────────────────
 
@@ -1605,40 +1414,83 @@ export default function teamExtension(pi: ExtensionAPI) {
 		}
 	});
 
-	// ─── Agent end: warn if agent didn't report ───────────────────────────
+	// ─── Agent end: auto-report to orchestrator ───────────────────────────
 
-	pi.on("agent_end", async (_event, ctx) => {
+	pi.on("agent_end", async (event, ctx) => {
 		const task = process.env.PI_TEAM_TASK ?? currentWorkerState?.task;
 		const role = process.env.PI_TEAM_ROLE ?? currentWorkerState?.role;
 
 		if (!task || !role || role === "orchestrator") return;
 
-		// Check if the worker reported via team_report
+		// Extract result from conversation
+		const result = extractAgentResult(event.messages);
+		const lastAssistant = findLastAssistantMessage(event.messages);
+		const stopReason = lastAssistant?.stopReason ?? "unknown";
+
+		// Load state
 		const state = loadState(ctx.cwd, task);
-		if (state && state.agentStatus[role] === "working") {
-			// Worker ended without calling team_report — notify orchestrator
-			const orchestratorMailbox = mailboxPath(ctx.cwd, task, "orchestrator");
-			appendToMailbox(orchestratorMailbox, {
-				type: "notify",
-				from: role,
-				to: "orchestrator",
-				body: `Agent "${role}" ended without calling team_report. They may have encountered an issue. Consider re-dispatching with /team redo ${task} ${role}.`,
-				timestamp: Date.now(),
-			});
+		if (!state) return;
 
-			// Mark as idle so they can be re-dispatched
-			state.agentStatus[role] = "idle";
-			saveState(ctx.cwd, state);
+		const dispatchId = activeDispatches.get(`${task}/${role}`);
 
-			// Update widget so orchestrator sees the agent is now idle
-			updateTeamWidget(ctx, state);
-
-			// Clear stale module-level state
-			if (currentWorkerState?.task === task && currentWorkerState?.role === role) {
-				currentWorkerState = null;
-			}
-			activeDispatches.delete(`${task}/${role}`);
+		// Only report if there's an active dispatch. If user typed in the surface
+		// without a pending dispatch, skip reporting to avoid noise.
+		if (!dispatchId) {
+			currentWorkerState = null;
+			return;
 		}
+
+		// Update dispatch history if we can find a matching entry
+		if (dispatchId) {
+			for (let i = state.dispatchHistory.length - 1; i >= 0; i--) {
+				if (state.dispatchHistory[i].dispatchId === dispatchId) {
+					if (!state.dispatchHistory[i].result) {
+						state.dispatchHistory[i].result = result;
+						state.dispatchHistory[i].stopReason = stopReason;
+					}
+					break;
+				}
+			}
+		} else {
+			for (let i = state.dispatchHistory.length - 1; i >= 0; i--) {
+				if (state.dispatchHistory[i].agent === role && !state.dispatchHistory[i].result) {
+					state.dispatchHistory[i].result = result;
+					state.dispatchHistory[i].stopReason = stopReason;
+					break;
+				}
+			}
+		}
+
+		// Mark agent as idle (session is over)
+		state.agentStatus[role] = "idle";
+		saveState(ctx.cwd, state);
+
+		// Update widget
+		updateTeamWidget(ctx, state);
+
+		// Write result to orchestrator mailbox ALWAYS
+		const orchestratorMailbox = mailboxPath(ctx.cwd, task, "orchestrator");
+		appendToMailbox(orchestratorMailbox, {
+			type: "message",
+			from: role,
+			to: "orchestrator",
+			body: JSON.stringify({ type: "report", result, stopReason, dispatchId }),
+			timestamp: Date.now(),
+		});
+
+		// Notify
+		terminalNotify("Pi", `${role} ended (${stopReason}) for ${task}`);
+		try {
+			await cmuxNotify("Pi", `${role} ended (${stopReason}) for ${task}`);
+		} catch {
+			// cmux not available
+		}
+
+		// Clean up module-level state
+		if (currentWorkerState?.task === task && currentWorkerState?.role === role) {
+			currentWorkerState = null;
+		}
+		activeDispatches.delete(`${task}/${role}`);
 	});
 
 	// ─── Session shutdown: cleanup resources ────────────────────────────────
