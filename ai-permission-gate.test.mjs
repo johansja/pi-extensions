@@ -190,8 +190,8 @@ describe("CWD-aware system prompt content", () => {
 		assert.match(extensionSource, /Current working directory:/);
 	});
 
-	it("classifiesCommand accepts cwd parameter", () => {
-		assert.match(extensionSource, /classifyCommand\(command:\s*string,\s*cwd:\s*string/);
+	it("classifyCommand accepts cwd parameter", () => {
+		assert.match(extensionSource, /classifyCommand\([^)]*command:\s*string[^)]*cwd:\s*string/s);
 	});
 
 	it("passes ctx.cwd to classifyCommand", () => {
@@ -228,6 +228,39 @@ describe("CWD-aware system prompt content", () => {
 
 	it("classifyCommand has CWD fallback guard", () => {
 		assert.match(extensionSource, /if \(!cwd\)\s*\{\s*cwd = process\.cwd\(\)/);
+	});
+
+	it("uses completeSimple from @mariozechner/pi-ai for classification", () => {
+		assert.match(extensionSource, /completeSimple/);
+		assert.match(extensionSource, /from "@mariozechner\/pi-ai"/);
+	});
+
+	it("does NOT use createAgentSession (heavier than needed)", () => {
+		assert.doesNotMatch(extensionSource, /createAgentSession/);
+	});
+
+	it("does NOT use SessionManager for classification", () => {
+		assert.doesNotMatch(extensionSource, /SessionManager/);
+	});
+
+	it("does NOT include subprocess spawn for classification", () => {
+		assert.doesNotMatch(extensionSource, /from "node:child_process"/);
+	});
+
+	it("does NOT include temp file creation for prompts", () => {
+		assert.doesNotMatch(extensionSource, /mkdtemp.*pi-ai-perm/);
+	});
+
+	it("resolveModel function exists for PI_AI_PERM_GATE_MODEL", () => {
+		assert.match(extensionSource, /async function resolveModel/);
+	});
+
+	it("falls back to ctx.model when no PI_AI_PERM_GATE_MODEL is set", () => {
+		assert.match(extensionSource, /resolveModel.*\?\?.*ctx\.model/s);
+	});
+
+	it("resolves API key via ModelRegistry.getApiKeyAndHeaders", () => {
+		assert.match(extensionSource, /getApiKeyAndHeaders/);
 	});
 
 	it("does NOT include CWD_MAX_RISK env var (LLM-only approach)", () => {

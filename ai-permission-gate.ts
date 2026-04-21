@@ -1,9 +1,8 @@
 /**
  * AI Permission Gate Extension
  *
- * Uses an LLM (spawned as a child pi process) to determine whether
- * a bash command is potentially harmful and should require user
- * confirmation before execution.
+ * Uses the pi-ai completeSimple() API to classify bash commands by risk level
+ * and require user confirmation before executing potentially harmful ones.
  *
  * Instead of maintaining a long list of regex patterns, this extension
  * asks a fast, cheap model to judge each command. The LLM returns a
@@ -17,7 +16,7 @@
  *   or risk-downgrading logic — the LLM makes CWD-aware judgments directly.
  *
  * Configuration via environment variables:
- *   PI_AI_PERM_GATE_MODEL       - Model to use for classification (default: pi's default model)
+ *   PI_AI_PERM_GATE_MODEL       - Model to use for classification (format: "provider/modelId", default: session model)
  *   PI_AI_PERM_GATE_BLOCK_LEVEL - Minimum risk level to block: "low" | "medium" | "high" (default: "low")
  *     "low"    = block on any risk (safest, most confirmations)
  *     "medium" = block on medium and high risk
@@ -26,11 +25,8 @@
  *   PI_AI_PERM_GATE_FALLBACK    - What to do if LLM fails: "allow" | "block" | "confirm" (default: "confirm")
  */
 
-import { spawn } from "node:child_process";
-import * as fs from "node:fs";
-import * as os from "node:os";
-import * as path from "node:path";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import { AuthStorage, ModelRegistry, type ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import { completeSimple, type Model, type Api, type Context } from "@mariozechner/pi-ai";
 
 // Risk levels, ordered from least to most severe
 const RISK_LEVELS = ["safe", "low", "medium", "high"] as const;
@@ -115,132 +111,136 @@ function parseVerdict(raw: string): Verdict {
 	return { risk: "medium", reason: "Could not parse LLM verdict" };
 }
 
-async function classifyCommand(command: string, cwd: string, model: string | undefined, timeout: number, signal: AbortSignal | undefined): Promise<Verdict> {
+/**
+ * Resolve a model from PI_AI_PERM_GATE_MODEL env var.
+ * Accepts "provider/modelId" format (e.g., "anthropic/claude-sonnet-4-5")
+ * or a bare model id that's searched across providers.
+ * Returns undefined if no env var is set (caller should fall back to ctx.model).
+ */
+async function resolveModel(modelSpec: string | undefined): Promise<Model<Api> | undefined> {
+	if (!modelSpec) return undefined;
+
+	const authStorage = AuthStorage.create();
+	const modelRegistry = ModelRegistry.create(authStorage);
+
+	// Support "provider/modelId" format
+	const slashIdx = modelSpec.indexOf("/");
+	if (slashIdx !== -1) {
+		const provider = modelSpec.slice(0, slashIdx);
+		const modelId = modelSpec.slice(slashIdx + 1);
+		const model = modelRegistry.find(provider, modelId);
+		if (!model) {
+			throw new Error(
+				`Model not found: ${modelSpec}. Available models: ${modelRegistry.getAvailable().map((m) => `${m.provider}/${m.id}`).join(", ")}`,
+			);
+		}
+		return model;
+	}
+
+	// Bare model id — search across all providers
+	const available = modelRegistry.getAvailable();
+	const exactMatch = available.find((m) => m.id === modelSpec);
+	if (exactMatch) return exactMatch;
+
+	// Partial/fuzzy match on model id or name
+	const partialMatches = available.filter(
+		(m) =>
+			m.id.toLowerCase().includes(modelSpec.toLowerCase()) ||
+			(m.name && m.name.toLowerCase().includes(modelSpec.toLowerCase())),
+	);
+	if (partialMatches.length === 1) return partialMatches[0];
+	if (partialMatches.length > 1) {
+		throw new Error(
+			`Ambiguous model "${modelSpec}" matches: ${partialMatches.map((m) => `${m.provider}/${m.id}`).join(", ")}. Use provider/modelId format.`,
+		);
+	}
+
+	throw new Error(
+		`Model not found: ${modelSpec}. Available models: ${available.map((m) => `${m.provider}/${m.id}`).join(", ")}`,
+	);
+}
+
+/**
+ * Classify a shell command using the pi-ai completeSimple() API.
+ * Sends a single-shot LLM request with the safety classifier system prompt
+ * and returns the parsed verdict.
+ */
+async function classifyCommand(
+	command: string,
+	cwd: string,
+	model: Model<Api>,
+	apiKey: string | undefined,
+	timeout: number,
+	signal: AbortSignal | undefined,
+): Promise<Verdict> {
 	// Fallback to process CWD if ctx.cwd is missing
 	if (!cwd) {
 		cwd = process.cwd();
 	}
-	// Write the system prompt and user prompt to temp files so we can pass them to pi
-	const tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-ai-perm-"));
+
+	const context: Context = {
+		systemPrompt: SYSTEM_PROMPT,
+		messages: [
+			{
+				role: "user",
+				content: `Analyze this shell command for safety: ${command}\n\nCurrent working directory: \`${cwd}\``,
+				timestamp: Date.now(),
+			},
+		],
+	};
+
+	// Apply timeout via a combined AbortController
+	let timedOut = false;
+	const timeoutController = new AbortController();
+
+	const timer = setTimeout(() => {
+		timedOut = true;
+		timeoutController.abort();
+	}, timeout);
+
+	// Forward user's abort signal to the timeout controller
+	const onAbort = () => timeoutController.abort();
+	if (signal) {
+		if (signal.aborted) {
+			timeoutController.abort();
+		} else {
+			signal.addEventListener("abort", onAbort, { once: true });
+		}
+	}
 
 	try {
-		const promptPath = path.join(tmpDir, "prompt.md");
-		await fs.promises.writeFile(promptPath, SYSTEM_PROMPT, { encoding: "utf-8", mode: 0o600 });
-
-		const args: string[] = [
-			"--mode", "json",
-			"-p",
-			"--no-session",
-			"--no-extensions",
-			"--tools", "read", // need at least one tool; read is harmless
-			"--append-system-prompt", promptPath,
-		];
-
-		if (model) {
-			args.push("--model", model);
-		}
-
-		// The user prompt is the command to classify, with CWD context
-		args.push(`Analyze this shell command for safety: ${command}\n\nCurrent working directory: \`${cwd}\``);
-
-		const invocation = getPiInvocation(args);
-		let buffer = "";
-		let lastAssistantText = "";
-
-		const exitCode = await new Promise<number>((resolve, reject) => {
-			const proc = spawn(invocation.command, invocation.args, {
-				cwd: os.homedir(),
-				shell: false,
-				stdio: ["ignore", "pipe", "pipe"],
-				env: { ...process.env },
-			});
-
-			const processLine = (line: string) => {
-				if (!line.trim()) return;
-				let event: any;
-				try {
-					event = JSON.parse(line);
-				} catch {
-					return;
-				}
-
-				if (event.type === "message_end" && event.message?.role === "assistant") {
-					for (const part of event.message.content) {
-						if (part.type === "text") {
-							lastAssistantText = part.text;
-						}
-					}
-				}
-			};
-
-			proc.stdout.on("data", (data: Buffer) => {
-				buffer += data.toString();
-				const lines = buffer.split("\n");
-				buffer = lines.pop() || "";
-				for (const line of lines) processLine(line);
-			});
-
-			proc.on("close", (code) => {
-				if (buffer.trim()) processLine(buffer);
-				resolve(code ?? 1);
-			});
-
-			proc.on("error", (err) => {
-				reject(err);
-			});
-
-			// Handle timeout
-			const timer = setTimeout(() => {
-				proc.kill("SIGTERM");
-				setTimeout(() => {
-					if (!proc.killed) proc.kill("SIGKILL");
-				}, 3000);
-			}, timeout);
-
-			proc.on("close", () => clearTimeout(timer));
-
-			// Handle abort signal
-			if (signal) {
-				const killProc = () => {
-					proc.kill("SIGTERM");
-					setTimeout(() => {
-						if (!proc.killed) proc.kill("SIGKILL");
-					}, 3000);
-				};
-				if (signal.aborted) killProc();
-				else signal.addEventListener("abort", killProc, { once: true });
-			}
+		const response = await completeSimple(model, context, {
+			apiKey,
+			signal: timeoutController.signal,
 		});
 
-		if (exitCode !== 0 || !lastAssistantText) {
-			throw new Error(`LLM classification failed (exit code ${exitCode})`);
+		// Extract text from the assistant response
+		let responseText = "";
+		for (const part of response.content) {
+			if (part.type === "text") {
+				responseText += part.text;
+			}
 		}
 
-		return parseVerdict(lastAssistantText);
+		if (!responseText) {
+			throw new Error("LLM classification returned empty response");
+		}
+
+		return parseVerdict(responseText);
+	} catch (err) {
+		if (timedOut) {
+			throw new Error("LLM classification timed out");
+		}
+		if (signal?.aborted) {
+			throw new Error("LLM classification aborted");
+		}
+		throw err;
 	} finally {
-		// Cleanup temp dir
-		try {
-			await fs.promises.rm(tmpDir, { recursive: true, force: true });
-		} catch {
-			// ignore cleanup errors
+		clearTimeout(timer);
+		if (signal) {
+			signal.removeEventListener("abort", onAbort);
 		}
 	}
-}
-
-function getPiInvocation(args: string[]): { command: string; args: string[] } {
-	// Try to use the same pi binary that's running
-	const currentScript = process.argv[1];
-	if (currentScript && fs.existsSync(currentScript)) {
-		return { command: process.execPath, args: [currentScript, ...args] };
-	}
-
-	const execName = path.basename(process.execPath).toLowerCase();
-	const isGenericRuntime = /^(node|bun)(\.exe)?$/.test(execName);
-	if (!isGenericRuntime) {
-		return { command: process.execPath, args };
-	}
-
-	return { command: "pi", args };
 }
 
 function notify(title: string, body: string): void {
@@ -266,14 +266,26 @@ export default function (pi: ExtensionAPI) {
 		if (!command?.trim()) return undefined;
 
 		// Load settings from environment variables
-		const model = process.env.PI_AI_PERM_GATE_MODEL || undefined;
+		const modelSpec = process.env.PI_AI_PERM_GATE_MODEL || undefined;
 		const blockLevel = (process.env.PI_AI_PERM_GATE_BLOCK_LEVEL as RiskLevel) || "low";
 		const timeout = parseInt(process.env.PI_AI_PERM_GATE_TIMEOUT || "10000", 10);
 		const fallback = process.env.PI_AI_PERM_GATE_FALLBACK || "confirm";
 
 		let verdict: Verdict;
 		try {
-			verdict = await classifyCommand(command, ctx.cwd, model, timeout, ctx.signal);
+			// Use env var model if specified, otherwise fall back to the session's current model
+			const model = (await resolveModel(modelSpec)) ?? ctx.model;
+			if (!model) {
+				throw new Error("No model available for classification");
+			}
+
+			// Resolve API key via the session's model registry
+			const authResult = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+			if (!authResult.ok) {
+				throw new Error(`No API key for ${model.provider}/${model.id}: ${authResult.error}`);
+			}
+
+			verdict = await classifyCommand(command, ctx.cwd, model, authResult.apiKey, timeout, ctx.signal);
 		} catch (err) {
 			// LLM call failed - use fallback strategy
 			if (fallback === "allow") return undefined;
