@@ -141,6 +141,17 @@ function loadAgentSessionMeta(cwd: string, task: string, agentName: string): str
 	}
 }
 
+function sessionFileHasData(sessionFile: string): boolean {
+	try {
+		const content = fs.readFileSync(sessionFile, "utf-8").trim();
+		if (!content) return false;
+		// Header line + at least one entry line means there's real session data
+		return content.split("\n").length > 1;
+	} catch {
+		return false;
+	}
+}
+
 // ─── State persistence ───────────────────────────────────────────────────────
 
 function saveState(cwd: string, state: TeamState): void {
@@ -763,12 +774,13 @@ async function spawnAgent(
 
 	// Build the pi command
 	const args: string[] = [];
+	const isResume = sessionFile ? sessionFileHasData(sessionFile) : false;
 	if (sessionFile) args.push("--session", sessionFile);
-	if (agent.model) args.push("--model", agent.model);
+	if (!isResume && agent.model) args.push("--model", agent.model);
 	if (agent.tools && agent.tools.length > 0 && !agent.tools.includes("all")) {
 		args.push("--tools", agent.tools.join(","));
 	}
-	if (agent.thinking) args.push("--thinking", agent.thinking);
+	if (!isResume && agent.thinking) args.push("--thinking", agent.thinking);
 	args.push("--append-system-prompt", agent.filePath);
 	args.push("--append-system-prompt", contextFile);
 
