@@ -13,6 +13,10 @@ import { getAgentDir, parseFrontmatter } from "@mariozechner/pi-coding-agent";
 
 export type AgentScope = "user" | "project" | "both";
 
+/**
+ * Agent configuration from a .md file.
+ * An `AgentRosterEntry` is an `AgentConfig` without the `systemPrompt`.
+ */
 export interface AgentConfig {
 	name: string;
 	description: string;
