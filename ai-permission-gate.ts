@@ -16,7 +16,7 @@
  *   or risk-downgrading logic — the LLM makes CWD-aware judgments directly.
  *
  * Configuration via environment variables:
- *   PI_AI_PERM_GATE_MODEL       - Model to use for classification (format: "provider/modelId", default: session model)
+ *   PI_AI_PERM_GATE_MODEL       - Model for classification (format: "provider/modelId"). Overrides settings.json.
  *   PI_AI_PERM_GATE_BLOCK_LEVEL - Minimum risk level to block: "low" | "medium" | "high" (default: "low")
  *     "low"    = block on any risk (safest, most confirmations)
  *     "medium" = block on medium and high risk
@@ -25,7 +25,12 @@
  *   PI_AI_PERM_GATE_FALLBACK    - What to do if LLM fails: "allow" | "block" | "confirm" (default: "confirm")
  */
 
-import { AuthStorage, ModelRegistry, type ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import {
+	AuthStorage,
+	ModelRegistry,
+	SettingsManager,
+	type ExtensionAPI,
+} from "@mariozechner/pi-coding-agent";
 import { completeSimple, type Model, type Api, type Context } from "@mariozechner/pi-ai";
 
 // Risk levels, ordered from least to most severe
@@ -112,10 +117,25 @@ function parseVerdict(raw: string): Verdict {
 }
 
 /**
- * Resolve a model from PI_AI_PERM_GATE_MODEL env var.
+ * Read the permissionGate.model setting from settings.json.
+ * Returns undefined if not configured.
+ */
+function readPermissionGateModel(cwd: string, agentDir: string): string | undefined {
+	const settingsManager = SettingsManager.create(cwd, agentDir);
+	// SettingsManager doesn't expose custom keys, so read the raw global settings
+	const globalSettings = settingsManager.getGlobalSettings() as Record<string, unknown>;
+	const gate = globalSettings.permissionGate as Record<string, unknown> | undefined;
+	if (gate && typeof gate.model === "string") {
+		return gate.model;
+	}
+	return undefined;
+}
+
+/**
+ * Resolve a model from PI_AI_PERM_GATE_MODEL env var or settings.json.
  * Accepts "provider/modelId" format (e.g., "anthropic/claude-sonnet-4-5")
  * or a bare model id that's searched across providers.
- * Returns undefined if no env var is set (caller should fall back to ctx.model).
+ * Returns undefined if no model is configured (caller should fall back to ctx.model).
  */
 async function resolveModel(modelSpec: string | undefined): Promise<Model<Api> | undefined> {
 	if (!modelSpec) return undefined;
@@ -266,14 +286,17 @@ export default function (pi: ExtensionAPI) {
 		if (!command?.trim()) return undefined;
 
 		// Load settings from environment variables
-		const modelSpec = process.env.PI_AI_PERM_GATE_MODEL || undefined;
+		const modelSpec = process.env.PI_AI_PERM_GATE_MODEL
+			|| readPermissionGateModel(ctx.cwd, `${process.env.HOME}/.pi/agent`)
+			|| undefined;
 		const blockLevel = (process.env.PI_AI_PERM_GATE_BLOCK_LEVEL as RiskLevel) || "low";
 		const timeout = parseInt(process.env.PI_AI_PERM_GATE_TIMEOUT || "10000", 10);
 		const fallback = process.env.PI_AI_PERM_GATE_FALLBACK || "confirm";
 
 		let verdict: Verdict;
 		try {
-			// Use env var model if specified, otherwise fall back to the session's current model
+			// Use env var model if specified, otherwise prefer a fast/cheap model,
+			// falling back to the session's current model as last resort
 			const model = (await resolveModel(modelSpec)) ?? ctx.model;
 			if (!model) {
 				throw new Error("No model available for classification");
@@ -287,7 +310,12 @@ export default function (pi: ExtensionAPI) {
 
 			verdict = await classifyCommand(command, ctx.cwd, model, authResult.apiKey, timeout, ctx.signal);
 		} catch (err) {
-			// LLM call failed - use fallback strategy
+			// LLM call failed - log and use fallback strategy
+			const errDetail = err instanceof Error ? err.message : String(err);
+			console.error(`[ai-permission-gate] Classification failed: ${errDetail}`);
+			if (ctx.hasUI) {
+				ctx.ui.notify(`Permission gate error: ${errDetail}`, "error");
+			}
 			if (fallback === "allow") return undefined;
 			if (fallback === "block") {
 				if (!ctx.hasUI) {

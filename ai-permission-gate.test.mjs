@@ -251,12 +251,14 @@ describe("CWD-aware system prompt content", () => {
 		assert.doesNotMatch(extensionSource, /mkdtemp.*pi-ai-perm/);
 	});
 
-	it("resolveModel function exists for PI_AI_PERM_GATE_MODEL", () => {
-		assert.match(extensionSource, /async function resolveModel/);
+	it("resolveModel function reads from PI_AI_PERM_GATE_MODEL env var and settings.json", () => {
+		assert.match(extensionSource, /readPermissionGateModel/);
+		assert.match(extensionSource, /PI_AI_PERM_GATE_MODEL/);
+		assert.match(extensionSource, /permissionGate/);
 	});
 
 	it("falls back to ctx.model when no PI_AI_PERM_GATE_MODEL is set", () => {
-		assert.match(extensionSource, /resolveModel.*\?\?.*ctx\.model/s);
+		assert.match(extensionSource, /resolveModel.*ctx\.model/s);
 	});
 
 	it("resolves API key via ModelRegistry.getApiKeyAndHeaders", () => {

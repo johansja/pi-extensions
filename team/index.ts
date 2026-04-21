@@ -23,7 +23,6 @@
  *   team_orchestrate  — Dispatch an agent (orchestrator only)
  *   team_report       — Report work completion back to orchestrator (worker only)
  *   team_message      — Send challenge/notify/ack to orchestrator (worker) or agent (orchestrator)
- *   team_read_deliverables — Read all agent reports
  */
 
 import * as fs from "node:fs";
@@ -765,7 +764,6 @@ async function spawnAgent(
 		``,
 		`- Workflow directory: \`.pi/workflow/${task}/\``,
 		`- Your mailbox: \`.pi/workflow/${task}/mailbox/${agent.name}.json\``,
-		`- Other agents' reports: Use \`team_read_deliverables\` tool`,
 		``,
 		`## Communication Protocol`,
 		``,
@@ -779,10 +777,9 @@ async function spawnAgent(
 		`## Handoff Protocol`,
 		``,
 		`1. **Wait for dispatch** — Do not start work yet. The task instructions will arrive as a dispatch message from the orchestrator.`,
-		`2. **Read context** — Use \`team_read_deliverables\` to get any reports from prior agents.`,
-		`3. **Do your work** — Execute your responsibilities as defined by your role.`,
-		`4. **Report completion** — Call \`team_report\` with a summary. Include questions if needed.`,
-		`5. **Wait** — After reporting, wait for further instructions from the orchestrator.`,
+		`2. **Do your work** — Execute your responsibilities as defined by your role.`,
+		`3. **Report completion** — Call \`team_report\` with a summary. Include questions if needed.`,
+		`4. **Wait** — After reporting, wait for further instructions from the orchestrator.`,
 	].join("\n");
 	await fs.promises.writeFile(contextFile, contextContent, { encoding: "utf-8", mode: 0o600 });
 
@@ -1031,7 +1028,7 @@ export default function teamExtension(pi: ExtensionAPI) {
 			"Only available when you are the orchestrator.",
 		promptSnippet: "Dispatch an agent with instructions",
 		promptGuidelines: [
-			"Always dispatch one agent at a time. After dispatching, STOP — do not use team_read_deliverables or read files to check on the agent. You will be automatically re-invoked when the agent reports back.",
+			"Always dispatch one agent at a time. After dispatching, STOP and wait. You will be automatically re-invoked when the agent reports back via team_report.",
 			"You are a PURE DELEGATOR. Your job is ONLY to decide which agent to dispatch next and provide them with clear instructions. Never do work that a team agent can do — if a planner exists, you do NOT plan; if a reviewer exists, you do NOT review; if a worker exists, you do NOT implement.",
 			"When an agent reports completion, briefly note their result and dispatch the next agent. Do NOT re-analyze, re-plan, or re-review their work yourself — delegate to the appropriate specialist.",
 			"If an agent raises a challenge or question, address it by dispatching the right agent to handle it. Do not attempt to solve the challenge yourself.",
@@ -1366,63 +1363,6 @@ export default function teamExtension(pi: ExtensionAPI) {
 		},
 	});
 
-	// ─── team_read_deliverables tool ──────────────────────────────────────
-
-	pi.registerTool({
-		name: "team_read_deliverables",
-		label: "Read Team Deliverables",
-		description:
-			"Read all agent reports. Use at the start of your work to get " +
-			"context from previous agents, or when the orchestrator asks you to review what's been done. " +
-			"Do NOT use this to poll for agent progress after dispatching — you will be automatically re-invoked when agents report back.",
-		promptSnippet: "Read agent reports",
-		parameters: Type.Object({}),
-		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
-			const task = process.env.PI_TEAM_TASK ?? currentWorkerState?.task ?? currentTeamState?.task;
-
-			if (!task) {
-				return {
-					content: [{ type: "text", text: "Not in a team session." }],
-					isError: true,
-				};
-			}
-
-			const parts: string[] = [];
-
-			// Read all reports from dispatch history
-			const state = loadState(ctx.cwd, task);
-			if (state) {
-				for (const entry of state.dispatchHistory) {
-					if (entry.result) {
-						let section = `## ${entry.agent}\n\n${entry.result}`;
-						if (entry.questions && entry.questions.length > 0) {
-							section += "\n\n### Questions\n" + entry.questions.map(q => `- ${q}`).join("\n");
-						}
-						parts.push(section);
-					}
-				}
-			}
-
-			if (parts.length === 0) {
-				return { content: [{ type: "text", text: "No reports found yet." }] };
-			}
-
-			return { content: [{ type: "text", text: parts.join("\n\n---\n\n") }] };
-		},
-		renderCall(_args, theme, context) {
-			const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
-			text.setText(theme.fg("toolTitle", theme.bold("team_read_deliverables")));
-			return text;
-		},
-		renderResult(result, { expanded }, theme, context) {
-			let text = theme.fg("success", "✓ Read deliverables");
-			if (expanded && result.content[0]) {
-				const content = (result.content[0] as { text: string }).text;
-				text += "\n  " + theme.fg("dim", content.substring(0, 200) + (content.length > 200 ? "..." : ""));
-			}
-			return new Text(text, 0, 0);
-		},
-	});
 
 	// ─── Session start: restore state ─────────────────────────────────────
 
