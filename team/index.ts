@@ -12,12 +12,10 @@
  *   /team init <name> [<agent>...]   — Create team, become orchestrator (omitting agents loads all)
  *   /team status [name]              — Show workflow state
  *   /team redo <name> <agent> [msg]  — Re-dispatch an agent (manual override)
- *   /team shutdown [name]            — Graceful shutdown of all workers
  *   /team resume [name]              — Resume an interrupted team session
- *   /team complete [name]            — Mark team as completed and clean up
  *   /team list                       — List available agents
  *   /team history [name]             — Show dispatch history
- *   /team cleanup                    — Remove shutdown/completed/orphaned teams
+ *   /team cleanup <team-name>        — Remove a team regardless of status
  *
  * Tools (registered for LLM use):
  *   team_orchestrate  — Dispatch an agent (orchestrator only)
@@ -30,7 +28,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import { SessionManager, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { StringEnum } from "@mariozechner/pi-ai";
 import { Type } from "@sinclair/typebox";
 import { discoverAgents, type AgentConfig } from "./agents.js";
@@ -340,6 +338,8 @@ interface AvailableTeam {
 	hasWorkingAgents: boolean;
 }
 
+// TODO: listAvailableTeams only scans the given cwd. Consider adding an option to scan
+// across all project directories for a global team listing.
 function listAvailableTeams(cwd: string): AvailableTeam[] {
 	const workflowRoot = path.join(cwd, ".pi", "workflow");
 	const teams: AvailableTeam[] = [];
@@ -977,6 +977,36 @@ function setupMailboxWatching(
 	activeWatchers.push({ close: () => clearInterval(pollInterval) } as unknown as fs.FSWatcher);
 }
 
+// ─── Multi-project discovery ─────────────────────────────────────────────────
+
+/**
+ * Find all project directories that have `.pi/workflow/` subdirectories.
+ * Scans the pi sessions directory to discover project CWDs, plus the given current CWD.
+ */
+async function discoverProjectCWDs(currentCwd: string): Promise<string[]> {
+	const projectDirs: string[] = [currentCwd];
+
+	try {
+		// Use pi's SessionManager to find all known project CWDs
+		const sessions = await SessionManager.listAll();
+		for (const session of sessions) {
+			const cwd = session.cwd;
+			if (
+				cwd &&
+				cwd !== currentCwd &&
+				!projectDirs.includes(cwd) &&
+				fs.existsSync(path.join(cwd, ".pi", "workflow"))
+			) {
+				projectDirs.push(cwd);
+			}
+		}
+	} catch {
+		// SessionManager.listAll() may fail — just use currentCwd
+	}
+
+	return projectDirs;
+}
+
 // ─── Main extension ──────────────────────────────────────────────────────────
 
 export default function teamExtension(pi: ExtensionAPI) {
@@ -1526,7 +1556,51 @@ export default function teamExtension(pi: ExtensionAPI) {
 	pi.registerCommand("team", {
 		description: "Manage dynamic multi-agent team workflows",
 		getArgumentCompletions: (prefix: string) => {
-			const subcommands = ["init", "status", "redo", "shutdown", "resume", "complete", "list", "history", "cleanup"];
+			const parts = prefix.trim().split(/\s+/);
+			const subcommand = parts[0];
+			const argPrefix = parts[parts.length - 1] ?? "";
+
+			// Subcommands that accept a team name as first argument
+			const teamNameCommands = new Set(["cleanup", "resume", "status", "history", "redo"]);
+
+			// If we have a subcommand and are typing an argument, offer contextual completions
+			if (parts.length > 1 || prefix.endsWith(" ")) {
+				if (teamNameCommands.has(subcommand)) {
+					// Second argument for redo = agent names; all others = team names for first arg
+					if (subcommand === "redo" && (parts.length >= 3 || (parts.length === 2 && prefix.endsWith(" ")))) {
+						// Offer agent names from the specified team
+						try {
+							const wfDir = path.join(process.cwd(), ".pi", "workflow");
+							const statePath = path.join(wfDir, parts[1], "state.json");
+							const content = fs.readFileSync(statePath, "utf-8").trim();
+							if (content) {
+								const state = JSON.parse(content);
+								const agents: string[] = (state.agents ?? []).map((a: any) => a.name);
+								return agents
+									.filter((name: string) => name.startsWith(argPrefix))
+									.map((name: string) => ({ value: `${subcommand} ${parts[1]} ${name}`, label: name }));
+							}
+						} catch {
+							return [];
+						}
+					}
+
+					// Offer team names from .pi/workflow/
+					try {
+						const wfDir = path.join(process.cwd(), ".pi", "workflow");
+						const entries = fs.readdirSync(wfDir, { withFileTypes: true });
+						return entries
+							.filter((e) => e.isDirectory() && e.name.startsWith(argPrefix))
+							.map((e) => ({ value: `${subcommand} ${e.name}`, label: e.name }));
+					} catch {
+						return [];
+					}
+				}
+				return [];
+			}
+
+			// Complete subcommand names
+			const subcommands = ["init", "status", "redo", "resume", "list", "history", "cleanup"];
 			return subcommands
 				.filter((s) => s.startsWith(prefix))
 				.map((s) => ({ value: s, label: s }));
@@ -1806,48 +1880,6 @@ export default function teamExtension(pi: ExtensionAPI) {
 					break;
 				}
 
-				// ─── /team shutdown ─────────────────────────────────────
-				case "shutdown": {
-					const taskName = parts[1] ?? currentTeamState?.task ?? loadSessionTask(ctx);
-
-					if (!taskName) {
-						ctx.ui.notify("Usage: /team shutdown <task-name>", "warning");
-						return;
-					}
-
-					const state = currentTeamState ?? loadState(ctx.cwd, taskName);
-
-					// Send shutdown to all agents
-					if (state) {
-						state.status = "shutdown";
-
-						for (const agent of state.agents) {
-							const mp = mailboxPath(ctx.cwd, taskName, agent.name);
-							appendToMailbox(mp, {
-								type: "shutdown",
-								from: "orchestrator",
-								to: agent.name,
-								body: "Workflow shutdown requested.",
-								timestamp: Date.now(),
-							});
-						}
-
-						// Close cmux surfaces
-						for (const [agentName, surfaceId] of Object.entries(state.surfaceIds)) {
-							await cmuxCloseSurface(surfaceId);
-						}
-
-						saveState(ctx.cwd, state);
-					}
-
-					ctx.ui.setWidget("team-dashboard", undefined);
-					if (currentTeamState?.task === taskName) {
-						currentTeamState = null;
-					}
-					ctx.ui.notify(`Shutdown sent for "${taskName}"`, "info");
-					break;
-				}
-
 				// ─── /team resume ──────────────────────────────────────
 				case "resume": {
 					const taskName = parts[1];
@@ -1895,65 +1927,6 @@ export default function teamExtension(pi: ExtensionAPI) {
 						const resumed = await resumeTeam(pi, ctx, taskName);
 						if (resumed) currentTeamState = resumed;
 					}
-					break;
-				}
-
-				// ─── /team complete ────────────────────────────────────
-				case "complete": {
-					const taskName = parts[1] ?? currentTeamState?.task ?? loadSessionTask(ctx);
-
-					if (!taskName) {
-						ctx.ui.notify("Usage: /team complete [task-name]", "warning");
-						return;
-					}
-
-					const state = currentTeamState ?? loadState(ctx.cwd, taskName);
-					if (!state) {
-						ctx.ui.notify(`No workflow found for "${taskName}"`, "warning");
-						return;
-					}
-
-					// Mark any in-progress dispatches as completed
-					for (const entry of state.dispatchHistory) {
-						if (!entry.result) {
-							entry.result = "[Team completed]";
-						}
-					}
-
-					// Mark all agents idle
-					for (const agent of state.agents) {
-						state.agentStatus[agent.name] = "idle";
-					}
-
-					state.status = "completed";
-
-					// Send shutdown to all agents
-					for (const agent of state.agents) {
-						const mp = mailboxPath(ctx.cwd, taskName, agent.name);
-						appendToMailbox(mp, {
-							type: "shutdown",
-							from: "orchestrator",
-							to: agent.name,
-							body: "Team completed. Thank you!",
-							timestamp: Date.now(),
-						});
-					}
-
-					// Close cmux surfaces
-					for (const surfaceId of Object.values(state.surfaceIds)) {
-						await cmuxCloseSurface(surfaceId);
-					}
-
-					saveState(ctx.cwd, state);
-
-					// Clear widget and session state
-					ctx.ui.setWidget("team-dashboard", undefined);
-					if (currentTeamState?.task === taskName) {
-						currentTeamState = null;
-					}
-
-					ctx.ui.notify(`✅ Team "${taskName}" marked as completed.`, "info");
-					await cmuxLog("info", `Team "${taskName}" marked as completed`);
 					break;
 				}
 
@@ -2021,99 +1994,65 @@ export default function teamExtension(pi: ExtensionAPI) {
 
 				// ─── /team cleanup ──────────────────────────────────────
 				case "cleanup": {
-					const wfDir = path.join(ctx.cwd, ".pi", "workflow");
+					const targetTeam = parts[1];
 
-					if (!fs.existsSync(wfDir)) {
-						ctx.ui.notify("No teams to clean up.", "info");
+					if (!targetTeam) {
+						ctx.ui.notify("Usage: /team cleanup <team-name>", "warning");
 						break;
 					}
 
-					const dirEntries = fs.readdirSync(wfDir, { withFileTypes: true });
-					const deletable: { name: string; status: string }[] = [];
+					// Clean up a specific team by name, regardless of status
+					const projectDirs = await discoverProjectCWDs(ctx.cwd);
+					let found = false;
 
-					for (const entry of dirEntries) {
-						if (!entry.isDirectory()) continue;
-						const name = entry.name;
+					for (const projectDir of projectDirs) {
+						const teamDir = path.join(projectDir, ".pi", "workflow", targetTeam);
+						if (!fs.existsSync(teamDir)) continue;
 
-						// Skip the currently active team
-						if (currentTeamState?.task === name) continue;
-
-						const sp = path.join(wfDir, name, "state.json");
-						let status: string | null = null;
+						found = true;
+						let status = "(unknown)";
 
 						try {
-							const content = fs.readFileSync(sp, "utf-8").trim();
+							const content = fs.readFileSync(path.join(teamDir, "state.json"), "utf-8").trim();
 							if (content) {
 								const state = JSON.parse(content);
-								status = state.status ?? null;
+								status = state.status ?? "(no status)";
 							}
 						} catch {
-							// No state.json or invalid — deletable
+							status = "(no state)";
 						}
 
-						// Deletable if shutdown, completed, or no status/state.json
-						if (status === "shutdown" || status === "completed" || status === null) {
-							deletable.push({ name, status: status ?? "(no state)" });
+						const projectLabel = projectDir === ctx.cwd
+							? ""
+							: ` [${path.basename(projectDir)}]`;
+
+						const confirmed = await ctx.ui.confirm(
+							"Team Cleanup",
+							`Delete team "${targetTeam}"${projectLabel} (status: ${status})?`,
+						);
+						if (!confirmed) {
+							ctx.ui.notify("Cleanup cancelled.", "info");
+							break;
 						}
-					}
 
-					if (deletable.length === 0) {
-						ctx.ui.notify("No teams to clean up.", "info");
-						break;
-					}
-
-					// Show preview
-					const previewLines = deletable.map(d => `  🗑️ ${d.name} (${d.status})`);
-					ctx.ui.notify(`Teams to clean up:\n${previewLines.join("\n")}`, "info");
-
-					// Confirm
-					const confirmed = await ctx.ui.confirm(
-						"Team Cleanup",
-						`Delete ${deletable.length} team${deletable.length !== 1 ? "s" : ""}?`,
-					);
-					if (!confirmed) {
-						ctx.ui.notify("Cleanup cancelled.", "info");
-						break;
-					}
-
-					// Delete confirmed teams
-					let deletedCount = 0;
-					for (const team of deletable) {
 						// Close cmux surfaces before deletion (best effort)
 						try {
-							const sp = path.join(wfDir, team.name, "state.json");
-							const content = fs.readFileSync(sp, "utf-8");
+							const content = fs.readFileSync(path.join(teamDir, "state.json"), "utf-8");
 							const state = JSON.parse(content);
 							for (const surfaceId of Object.values(state.surfaceIds ?? {})) {
 								await cmuxCloseSurface(surfaceId).catch(() => {});
 							}
 						} catch { /* best effort */ }
 
-						await fs.promises.rm(path.join(wfDir, team.name), { recursive: true, force: true });
-						deletedCount++;
+						await fs.promises.rm(teamDir, { recursive: true, force: true });
+						ctx.ui.notify(`🧹 Cleaned up team "${targetTeam}"${projectLabel}`, "info");
+						await cmuxLog("info", `Cleaned up team "${targetTeam}"`);
+						break;
 					}
 
-					// Clean /tmp/pi-team-* temp dirs (best-effort)
-					let tempCleaned = 0;
-					try {
-						const tmpEntries = await fs.promises.readdir(os.tmpdir());
-						for (const entry of tmpEntries) {
-							if (entry.startsWith("pi-team-")) {
-								const fullPath = path.join(os.tmpdir(), entry);
-								try {
-									await fs.promises.rm(fullPath, { recursive: true, force: true });
-									tempCleaned++;
-								} catch {
-									// Best effort
-								}
-							}
-						}
-					} catch {
-						// Best effort
+					if (!found) {
+						ctx.ui.notify(`Team "${targetTeam}" not found.`, "error");
 					}
-
-					ctx.ui.notify(`🧹 Cleaned up ${deletedCount} team${deletedCount !== 1 ? "s" : ""}${tempCleaned > 0 ? ` and ${tempCleaned} temp dir${tempCleaned !== 1 ? "s" : ""}` : ""}`, "info");
-					await cmuxLog("info", `Cleaned up ${deletedCount} team(s)`);
 					break;
 				}
 
@@ -2123,10 +2062,8 @@ export default function teamExtension(pi: ExtensionAPI) {
 							"  /team init <team-name> [<agent>...]\n" +
 							"  /team status [team-name]\n" +
 							"  /team redo <team-name> <agent> [message]\n" +
-							"  /team shutdown [team-name]\n" +
 							"  /team resume [task-name]\n" +
-							"  /team complete [task-name]\n" +
-							"  /team cleanup\n" +
+							"  /team cleanup <team-name>\n" +
 							"  /team list\n" +
 							"  /team history [team-name]",
 						"info",
