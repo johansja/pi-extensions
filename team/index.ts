@@ -73,8 +73,6 @@ interface TeamState {
 	orchestratorPaneId: string | null;
 	surfaceIds: Record<string, string>;
 	dispatchHistory: DispatchEntry[];
-	dispatchCount: number;
-	maxDispatches: number;
 	pendingResumeContext?: string;
 	pendingTeamResume?: number; // timestamp (Date.now()) — auto-expires after 5 minutes
 }
@@ -338,13 +336,11 @@ interface AvailableTeam {
 	task: string;
 	status: "active" | "shutdown" | "completed";
 	agentCount: number;
-	dispatchCount: number;
-	maxDispatches: number;
 	lastActivity: number;
 	hasWorkingAgents: boolean;
 }
 
-function listAvailableTeams(cwd: string, defaultMaxDispatches: number = 30): AvailableTeam[] {
+function listAvailableTeams(cwd: string): AvailableTeam[] {
 	const workflowRoot = path.join(cwd, ".pi", "workflow");
 	const teams: AvailableTeam[] = [];
 
@@ -372,8 +368,6 @@ function listAvailableTeams(cwd: string, defaultMaxDispatches: number = 30): Ava
 					task: state.task ?? entry.name,
 					status: state.status ?? "active",
 					agentCount: (state.agents ?? []).length,
-					dispatchCount: state.dispatchCount ?? 0,
-					maxDispatches: state.maxDispatches ?? defaultMaxDispatches,
 					lastActivity,
 					hasWorkingAgents,
 				});
@@ -419,11 +413,6 @@ function buildResumeContext(state: TeamState): string {
 		lines.push("");
 	}
 
-	// Budget
-	const remaining = state.maxDispatches - state.dispatchCount;
-	lines.push(`**Dispatch budget:** ${state.dispatchCount}/${state.maxDispatches} used (${remaining} remaining)`);
-	lines.push("");
-
 	// Agent roster
 	lines.push("**Agents:**");
 	for (const agent of state.agents) {
@@ -438,8 +427,8 @@ function buildResumeContext(state: TeamState): string {
 		lines.push("All previously dispatched work has been completed. No re-dispatch is necessary.");
 	} else if (interruptedDispatches.length > 0) {
 		lines.push("The interrupted agents have been marked idle. Their previous tasks were not completed.");
-	} else if (remaining <= 0) {
-		lines.push("No dispatches remaining. Consider using /team complete to finalize.");
+	} else {
+		lines.push("Use the `team_orchestrate` tool to dispatch an agent.");
 	}
 
 	return lines.join("\n");
@@ -597,9 +586,7 @@ function updateTeamWidget(ctx: ExtensionContext, state: TeamState): void {
 		lines.push(`   ${icon} ${agent.name} (${status})`);
 	}
 
-	const remaining = state.maxDispatches - state.dispatchCount;
 	lines.push("");
-	lines.push(`   Dispatches: ${state.dispatchCount}/${state.maxDispatches} (${remaining} remaining)`);
 
 	ctx.ui.setWidget("team-dashboard", (tui, theme) => {
 		return new Text(lines.map(l => theme.fg("muted", l)).join("\n"), 0, 0);
@@ -726,16 +713,7 @@ function buildOrchestratorContext(state: TeamState, extraInfo?: string): string 
 		lines.push("");
 	}
 
-	// Dispatch budget
-	const remaining = state.maxDispatches - state.dispatchCount;
-	lines.push(`**Dispatches:** ${state.dispatchCount}/${state.maxDispatches} used (${remaining} remaining)`);
-	lines.push("");
-
-	if (remaining <= 0) {
-		lines.push("⚠️ No dispatches remaining. Use /team shutdown to end.");
-	} else {
-		lines.push("Use the `team_orchestrate` tool to dispatch an agent.");
-	}
+	lines.push("Use the `team_orchestrate` tool to dispatch an agent.");
 
 	return lines.join("\n");
 }
@@ -1005,16 +983,6 @@ export default function teamExtension(pi: ExtensionAPI) {
 	let currentTeamState: TeamState | null = null;
 	let currentWorkerState: WorkerState | null = null;
 
-	pi.registerFlag("max-dispatches", {
-		description: "Maximum number of agent dispatches per team session (default: 30)",
-		type: "string",
-		default: "30",
-	});
-
-	function getMaxDispatches(): number {
-		const val = pi.getFlag("max-dispatches");
-		return parseInt(String(val ?? "30"), 10) || 30;
-	}
 
 	// ─── team_orchestrate tool (orchestrator only) ────────────────────────
 
@@ -1032,7 +1000,6 @@ export default function teamExtension(pi: ExtensionAPI) {
 			"You are a PURE DELEGATOR. Your job is ONLY to decide which agent to dispatch next and provide them with clear instructions. Never do work that a team agent can do — if a planner exists, you do NOT plan; if a reviewer exists, you do NOT review; if a worker exists, you do NOT implement.",
 			"When an agent reports completion, briefly note their result and dispatch the next agent. Do NOT re-analyze, re-plan, or re-review their work yourself — delegate to the appropriate specialist.",
 			"If an agent raises a challenge or question, address it by dispatching the right agent to handle it. Do not attempt to solve the challenge yourself.",
-			"You have a limited number of dispatches — use them wisely.",
 			"Give each agent clear, specific instructions about what you need them to do. Include relevant context from previous agents' reports.",
 		],
 		parameters: Type.Object({
@@ -1108,16 +1075,7 @@ export default function teamExtension(pi: ExtensionAPI) {
 					};
 				}
 
-				// Check dispatch budget
-				if (state.dispatchCount >= state.maxDispatches) {
-					return {
-						content: [{ type: "text", text: `Dispatch limit reached (${state.maxDispatches}). Use /team shutdown to end.` }],
-						isError: true,
-					};
-				}
-
 				// Record dispatch
-				state.dispatchCount++;
 				state.agentStatus[params.agent] = "working";
 				state.dispatchHistory.push({
 					agent: params.agent,
@@ -1166,11 +1124,10 @@ export default function teamExtension(pi: ExtensionAPI) {
 
 				updateTeamWidget(ctx, state);
 
-				const remaining = state.maxDispatches - state.dispatchCount;
 				return {
 					content: [{
 						type: "text",
-						text: `✅ Dispatched "${params.agent}" with instructions.\nDispatches: ${state.dispatchCount}/${state.maxDispatches} (${remaining} remaining)\n\n⏳ Wait for the agent to report back. You will be automatically re-invoked when they report back — do not poll or check for updates.`,
+						text: `✅ Dispatched "${params.agent}" with instructions.\n\n⏳ Wait for the agent to report back. You will be automatically re-invoked when they report back — do not poll or check for updates.`,
 					}],
 				};
 			}
@@ -1435,7 +1392,7 @@ export default function teamExtension(pi: ExtensionAPI) {
 		}
 
 		// Path 3: Notify about available teams from .pi/workflow/
-		const availableTeams = listAvailableTeams(ctx.cwd, getMaxDispatches()).filter(t => t.status === "active");
+		const availableTeams = listAvailableTeams(ctx.cwd).filter(t => t.status === "active");
 
 		if (availableTeams.length >= 1) {
 			const lines: string[] = availableTeams.length === 1
@@ -1443,7 +1400,7 @@ export default function teamExtension(pi: ExtensionAPI) {
 				: ["🔄 Multiple active teams found:"];
 			for (const team of availableTeams) {
 				const timeStr = team.lastActivity > 0 ? new Date(team.lastActivity).toLocaleString() : "unknown";
-				lines.push(`  🟢 ${team.task} — Agents: ${team.agentCount} | Dispatches: ${team.dispatchCount}/${team.maxDispatches} | Last: ${timeStr}`);
+				lines.push(`  🟢 ${team.task} — Agents: ${team.agentCount} | Last: ${timeStr}`);
 			}
 			lines.push("");
 			lines.push("Use /team resume <task-name> to resume a team.");
@@ -1657,8 +1614,6 @@ export default function teamExtension(pi: ExtensionAPI) {
 						orchestratorPaneId: null,
 						surfaceIds: {},
 						dispatchHistory: [],
-						dispatchCount: 0,
-						maxDispatches: getMaxDispatches(),
 					};
 					saveState(ctx.cwd, currentTeamState);
 					saveSessionState(pi, currentTeamState);
@@ -1762,7 +1717,6 @@ export default function teamExtension(pi: ExtensionAPI) {
 						}
 					}
 
-					lines.push(`\n📊 Dispatches: ${state.dispatchCount}/${state.maxDispatches}`);
 
 					ctx.ui.notify(lines.join("\n"), "info");
 					break;
@@ -1800,7 +1754,6 @@ export default function teamExtension(pi: ExtensionAPI) {
 					const instructions = message || `Re-do your previous task. Review your earlier work and improve on it.`;
 
 					state.agentStatus[agentName] = "working";
-					state.dispatchCount++;
 					state.dispatchHistory.push({
 						agent: agentName,
 						instructions,
@@ -1901,7 +1854,7 @@ export default function teamExtension(pi: ExtensionAPI) {
 
 					if (!taskName) {
 						// No arg — list available teams
-						const teams = listAvailableTeams(ctx.cwd, getMaxDispatches());
+						const teams = listAvailableTeams(ctx.cwd);
 						if (teams.length === 0) {
 							ctx.ui.notify("No teams found in .pi/workflow/", "info");
 							return;
@@ -1913,7 +1866,7 @@ export default function teamExtension(pi: ExtensionAPI) {
 							const workingTag = team.hasWorkingAgents ? " (has working agents)" : "";
 							const timeStr = team.lastActivity > 0 ? new Date(team.lastActivity).toLocaleString() : "unknown";
 							lines.push(`  ${statusIcon} ${team.task} — ${team.status}${workingTag}`);
-							lines.push(`     Agents: ${team.agentCount} | Dispatches: ${team.dispatchCount}/${team.maxDispatches} | Last activity: ${timeStr}`);
+							lines.push(`     Agents: ${team.agentCount} | Last activity: ${timeStr}`);
 						}
 
 						lines.push("");
