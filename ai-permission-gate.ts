@@ -32,6 +32,8 @@ import {
 	type ExtensionAPI,
 } from "@mariozechner/pi-coding-agent";
 import { completeSimple, type Model, type Api, type Context } from "@mariozechner/pi-ai";
+import * as fs from "node:fs";
+import * as path from "node:path";
 
 // Risk levels, ordered from least to most severe
 const RISK_LEVELS = ["safe", "low", "medium", "high"] as const;
@@ -116,6 +118,36 @@ function parseVerdict(raw: string): Verdict {
 	return { risk: "medium", reason: "Could not parse LLM verdict" };
 }
 
+function logCommandDecision(
+	command: string,
+	risk: RiskLevel,
+	blockLevel: RiskLevel,
+	decision: "allowed" | "blocked" | "confirmed",
+	reason?: string,
+): void {
+	const timestamp = new Date().toISOString();
+	const entry = {
+		timestamp,
+		command,
+		risk,
+		blockLevel,
+		decision,
+		reason,
+	};
+	const logLine = JSON.stringify(entry) + "\n";
+
+	const logFile = path.join(process.env.HOME || "/tmp", ".pi", "ai-permission-gate.jsonl");
+	try {
+		const dir = path.dirname(logFile);
+		if (!fs.existsSync(dir)) {
+			fs.mkdirSync(dir, { recursive: true });
+		}
+		fs.appendFileSync(logFile, logLine, { encoding: "utf-8" });
+	} catch {
+		// Silently fail if we can't write to log
+	}
+}
+
 /**
  * Read the permissionGate.model setting from settings.json.
  * Returns undefined if not configured.
@@ -127,6 +159,20 @@ function readPermissionGateModel(cwd: string, agentDir: string): string | undefi
 	const gate = globalSettings.permissionGate as Record<string, unknown> | undefined;
 	if (gate && typeof gate.model === "string") {
 		return gate.model;
+	}
+	return undefined;
+}
+
+/**
+ * Read the permissionGate.blockLevel setting from settings.json.
+ * Returns undefined if not configured or invalid.
+ */
+function readPermissionGateBlockLevel(cwd: string, agentDir: string): RiskLevel | undefined {
+	const settingsManager = SettingsManager.create(cwd, agentDir);
+	const globalSettings = settingsManager.getGlobalSettings() as Record<string, unknown>;
+	const gate = globalSettings.permissionGate as Record<string, unknown> | undefined;
+	if (gate && typeof gate.blockLevel === "string" && RISK_LEVELS.includes(gate.blockLevel as RiskLevel)) {
+		return gate.blockLevel as RiskLevel;
 	}
 	return undefined;
 }
@@ -289,7 +335,9 @@ export default function (pi: ExtensionAPI) {
 		const modelSpec = process.env.PI_AI_PERM_GATE_MODEL
 			|| readPermissionGateModel(ctx.cwd, `${process.env.HOME}/.pi/agent`)
 			|| undefined;
-		const blockLevel = (process.env.PI_AI_PERM_GATE_BLOCK_LEVEL as RiskLevel) || "low";
+		const blockLevel = (process.env.PI_AI_PERM_GATE_BLOCK_LEVEL as RiskLevel)
+			|| readPermissionGateBlockLevel(ctx.cwd, `${process.env.HOME}/.pi/agent`)
+			|| "low";
 		const timeout = parseInt(process.env.PI_AI_PERM_GATE_TIMEOUT || "10000", 10);
 		const fallback = process.env.PI_AI_PERM_GATE_FALLBACK || "confirm";
 
@@ -316,8 +364,12 @@ export default function (pi: ExtensionAPI) {
 			if (ctx.hasUI) {
 				ctx.ui.notify(`Permission gate error: ${errDetail}`, "error");
 			}
-			if (fallback === "allow") return undefined;
+			if (fallback === "allow") {
+				logCommandDecision(command, "unknown", blockLevel, "allowed", "Fallback allow after LLM failure");
+				return undefined;
+			}
 			if (fallback === "block") {
+				logCommandDecision(command, "unknown", blockLevel, "blocked", "Fallback block after LLM failure");
 				if (!ctx.hasUI) {
 					return { block: true, reason: "Command blocked: AI safety check failed" };
 				}
@@ -327,15 +379,20 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 			// fallback === "confirm" - ask the user
-			if (!ctx.hasUI) return undefined; // can't confirm in non-interactive mode, allow
+			if (!ctx.hasUI) {
+				logCommandDecision(command, "unknown", blockLevel, "allowed", "Fallback confirm without UI — allowed");
+				return undefined; // can't confirm in non-interactive mode, allow
+			}
 			notify("Pi", "Permission gate: awaiting input");
 			const choice = await ctx.ui.select(
 				`⚠️ AI safety check failed\n\n  ${command}\n\nThe LLM could not classify this command. Allow it?`,
 				["Yes", "No"],
 			);
 			if (choice !== "Yes") {
+				logCommandDecision(command, "unknown", blockLevel, "blocked", "Blocked by user (AI check failed)");
 				return { block: true, reason: "Blocked by user (AI check failed)" };
 			}
+			logCommandDecision(command, "unknown", blockLevel, "confirmed", "User confirmed after AI check failed");
 			return undefined;
 		}
 
@@ -345,6 +402,7 @@ export default function (pi: ExtensionAPI) {
 
 		if (commandRisk >= blockThreshold && verdict.risk !== "safe") {
 			if (!ctx.hasUI) {
+				logCommandDecision(command, verdict.risk, blockLevel, "blocked", verdict.reason);
 				return {
 					block: true,
 					reason: `Potentially dangerous command: ${verdict.reason}`,
@@ -359,8 +417,12 @@ export default function (pi: ExtensionAPI) {
 			);
 
 			if (choice !== "Yes") {
+				logCommandDecision(command, verdict.risk, blockLevel, "blocked", "Blocked by user");
 				return { block: true, reason: "Blocked by user" };
 			}
+			logCommandDecision(command, verdict.risk, blockLevel, "confirmed", verdict.reason);
+		} else {
+			logCommandDecision(command, verdict.risk, blockLevel, "allowed", verdict.reason);
 		}
 
 		return undefined;
