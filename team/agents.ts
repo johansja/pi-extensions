@@ -23,6 +23,7 @@ export interface AgentConfig {
 	tools?: string[];
 	model?: string;
 	thinking?: string;
+	approvalRequired?: boolean;
 	systemPrompt: string;
 	source: "user" | "project";
 	filePath: string;
@@ -73,12 +74,15 @@ function loadAgentsFromDir(dir: string, source: "user" | "project"): AgentConfig
 				.map((t: string) => t.trim())
 				.filter(Boolean);
 
+		const approvalRequired = frontmatter.approvalRequired === "true" || frontmatter.approvalRequired === true;
+
 		agents.push({
 			name: frontmatter.name,
 			description: frontmatter.description,
 			tools: tools && tools.length > 0 ? tools : undefined,
 			model: frontmatter.model,
 			thinking: frontmatter.thinking,
+			approvalRequired,
 			systemPrompt: body,
 			source,
 			filePath,

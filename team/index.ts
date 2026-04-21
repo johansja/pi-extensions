@@ -78,6 +78,13 @@ interface DispatchEntry {
 	dispatchId: string;
 }
 
+interface PendingDiscussion {
+	topic: "approval_required" | "conflict_resolution";
+	description: string;
+	createdAt: number;
+	relatedAgentNames: string[];
+}
+
 interface TeamState {
 	task: string;
 	role: "orchestrator";
@@ -89,6 +96,7 @@ interface TeamState {
 	dispatchHistory: DispatchEntry[];
 	pendingResumeContext?: string;
 	pendingTeamResume?: number; // timestamp (Date.now()) — auto-expires after 5 minutes
+	pendingDiscussion?: PendingDiscussion;
 }
 
 interface WorkerState {
@@ -792,8 +800,10 @@ function buildOrchestratorContext(state: TeamState, extraInfo?: string): string 
 	for (const agent of state.agents) {
 		const status = state.agentStatus[agent.name] ?? "idle";
 		const icon = statusIcon(status);
-		lines.push(`  ${icon} ${agent.name} (${status}) — ${agent.description}`);
+		const needsApproval = agent.approvalRequired ? " (requires approval)" : "";
+		lines.push(`  ${icon} ${agent.name} (${status})${needsApproval} — ${agent.description}`);
 	}
+
 	lines.push("");
 
 	// Delegation rules
@@ -836,6 +846,18 @@ function buildOrchestratorContext(state: TeamState, extraInfo?: string): string 
 	// Extra info (e.g., challenge details)
 	if (extraInfo) {
 		lines.push(extraInfo);
+		lines.push("");
+	}
+
+	if (state.pendingDiscussion) {
+		lines.push("");
+		lines.push("⚠️ **PENDING DISCUSSION — Awaiting User Input**");
+		lines.push("");
+		lines.push(`Topic: ${state.pendingDiscussion.topic}`);
+		lines.push(`Description: ${state.pendingDiscussion.description}`);
+		lines.push(`Involved agents: ${state.pendingDiscussion.relatedAgentNames.join(", ")}`);
+		lines.push("");
+		lines.push("You must NOT silently dispatch another agent right now. Review the user's most recent response (if any). If they have given clear direction, call team_orchestrate and the discussion will close automatically. Otherwise, continue the discussion with a concise message.");
 		lines.push("");
 	}
 
@@ -993,6 +1015,18 @@ function processOrchestratorMailbox(
 					}
 				}
 				saveState(ctx.cwd, state);
+
+				// After saving the dispatch history, check if this agent requires user approval
+				const senderAgent = state.agents.find(a => a.name === msg.from);
+				if (senderAgent?.approvalRequired && (report.result?.length ?? 0) > 0) {
+					state.pendingDiscussion = {
+						topic: "approval_required",
+						description: `${msg.from} has completed work that requires your approval before proceeding.`,
+						createdAt: Date.now(),
+						relatedAgentNames: [msg.from],
+					};
+					saveState(ctx.cwd, state);
+				}
 
 				const fullResult = report.result ?? "No result provided";
 				parts.push(`Agent "${msg.from}" completed:\n\n${fullResult}`);
@@ -1156,9 +1190,13 @@ export default function teamExtension(pi: ExtensionAPI) {
 		promptSnippet: "Dispatch an agent with instructions",
 		promptGuidelines: [
 			"Always dispatch one agent at a time. After dispatching, STOP and wait. You will be automatically re-invoked when the agent ends their session — do not poll or check for updates.",
-			"You are a PURE DELEGATOR. Your job is ONLY to decide which agent to dispatch next and provide them with clear instructions. Never do work that a team agent can do — if a planner exists, you do NOT plan; if a reviewer exists, you do NOT review; if a worker exists, you do NOT implement.",
+			"You are a PURE DELEGATOR. Your job is ONLY to decide which agent to dispatch next and provide them with clear instructions. Never do work that a team agent can do.",
 			"When an agent reports completion, briefly note their result and dispatch the next agent. Do NOT re-analyze, re-plan, or re-review their work yourself — delegate to the appropriate specialist.",
 			"Give each agent clear, specific instructions about what you need them to do. Include relevant context from previous agents' reports.",
+			"",
+			"**WHEN TO DISCUSS WITH THE USER — Do NOT call team_orchestrate. Write a concise message to the user and STOP:**",
+			"When an agent marked with approvalRequired completes, summarize its output in 3-5 bullets and ask the user for approval, changes, or direction before dispatching the next agent.",
+			"If a pending discussion is active (shown in your context below), review the user's latest response. If they gave you clear direction, call team_orchestrate and the discussion will close automatically. If they need clarification, continue the discussion with another message.",
 		],
 		parameters: Type.Object({
 			action: StringEnum(["dispatch"] as const, {
@@ -1242,6 +1280,11 @@ export default function teamExtension(pi: ExtensionAPI) {
 					timestamp: Date.now(),
 					dispatchId,
 				});
+
+				// Clear pending discussion now that we're actually dispatching
+				if (state.pendingDiscussion) {
+					delete state.pendingDiscussion;
+				}
 
 				// Write dispatch to agent's mailbox (agent is already running and watching)
 				const agentMailbox = mailboxPath(ctx.cwd, task, params.agent);
@@ -1781,7 +1824,8 @@ export default function teamExtension(pi: ExtensionAPI) {
 						const status = state.agentStatus[agent.name] ?? "idle";
 						const icon = statusIcon(status);
 						const surface = state.surfaceIds[agent.name] ? ` (surface: ${state.surfaceIds[agent.name]})` : "";
-						lines.push(`  ${icon} ${agent.name} — ${status}${surface}`);
+						const needsApproval = agent.approvalRequired ? " (requires approval)" : "";
+						lines.push(`  ${icon} ${agent.name} — ${status}${surface}${needsApproval}`);
 					}
 
 					// Reports
@@ -1894,6 +1938,11 @@ export default function teamExtension(pi: ExtensionAPI) {
 						}
 					}
 
+					// User explicitly overriding — clear any pending discussion before saving
+					if (state.pendingDiscussion) {
+						delete state.pendingDiscussion;
+					}
+
 					saveState(ctx.cwd, state);
 					currentTeamState = state;
 
@@ -1985,7 +2034,8 @@ export default function teamExtension(pi: ExtensionAPI) {
 								? " (tools: all)"
 								: ` (tools: ${agent.tools.join(", ")})`
 							: "";
-						lines.push(`  ${source} ${agent.name}${model}${tools}`);
+						const approval = agent.approvalRequired ? " (requires approval)" : "";
+						lines.push(`  ${source} ${agent.name}${model}${tools}${approval}`);
 						lines.push(`     ${agent.description}`);
 					}
 
