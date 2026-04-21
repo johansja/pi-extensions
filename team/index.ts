@@ -31,7 +31,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { StringEnum } from "@mariozechner/pi-ai";
 import { Type } from "@sinclair/typebox";
 import { discoverAgents, type AgentConfig } from "./agents.js";
@@ -77,6 +77,7 @@ interface TeamState {
 	dispatchCount: number;
 	maxDispatches: number;
 	pendingResumeContext?: string;
+	pendingTeamResume?: number; // timestamp (Date.now()) — auto-expires after 5 minutes
 }
 
 interface WorkerState {
@@ -113,6 +114,38 @@ function mailboxPath(cwd: string, task: string, agent: string): string {
 	return path.join(mailboxDir(cwd, task), `${agent}.json`);
 }
 
+// ─── Session meta helpers ─────────────────────────────────────────────────
+
+function agentSessionDir(cwd: string, task: string): string {
+	return path.join(workflowDir(cwd, task), "sessions");
+}
+
+function agentSessionMetaPath(cwd: string, task: string, agentName: string): string {
+	return path.join(agentSessionDir(cwd, task), `${agentName}.json`);
+}
+
+function saveAgentSessionMeta(cwd: string, task: string, agentName: string, sessionFile: string): void {
+	const dir = agentSessionDir(cwd, task);
+	fs.mkdirSync(dir, { recursive: true });
+	const metaPath = agentSessionMetaPath(cwd, task, agentName);
+	fs.writeFileSync(metaPath, JSON.stringify({ sessionFile }), { encoding: "utf-8" });
+}
+
+function loadAgentSessionMeta(cwd: string, task: string, agentName: string): string | null {
+	try {
+		const metaPath = agentSessionMetaPath(cwd, task, agentName);
+		const content = fs.readFileSync(metaPath, "utf-8").trim();
+		if (!content) return null;
+		const meta = JSON.parse(content) as { sessionFile: string };
+		if (meta.sessionFile && fs.existsSync(meta.sessionFile)) {
+			return meta.sessionFile;
+		}
+		return null;
+	} catch {
+		return null;
+	}
+}
+
 // ─── State persistence ───────────────────────────────────────────────────────
 
 function saveState(cwd: string, state: TeamState): void {
@@ -146,10 +179,17 @@ function saveSessionState(pi: ExtensionAPI, state: TeamState): void {
 
 function loadSessionTask(ctx: ExtensionContext): string | null {
 	const entries = ctx.sessionManager.getEntries();
-	const entry = entries
-		.filter((e: { type: string; customType?: string }) => e.type === "custom" && e.customType === "team-orchestrator")
-		.pop() as { data?: { task: string } } | undefined;
-	return entry?.data?.task ?? null;
+	// Iterate from newest to oldest, returning the first task whose state file exists.
+	// This avoids stale entries from old sessions that no longer have a workflow.
+	for (let i = entries.length - 1; i >= 0; i--) {
+		const e = entries[i] as { type: string; customType?: string; data?: { task: string } };
+		if (e.type === "custom" && e.customType === "team-orchestrator" && e.data?.task) {
+			if (fs.existsSync(statePath(ctx.cwd, e.data.task))) {
+				return e.data.task;
+			}
+		}
+	}
+	return null;
 }
 
 function saveWorkerState(pi: ExtensionAPI, state: WorkerState): void {
@@ -500,6 +540,7 @@ async function resumeTeam(pi: ExtensionAPI, ctx: ExtensionContext, taskName: str
 
 	// Re-spawn all agent tabs
 	for (const agent of state.agents) {
+		const sessionFile = loadAgentSessionMeta(ctx.cwd, taskName, agent.name);
 		const { surfaceId } = await spawnAgent(
 			pi, ctx, agent, taskName,
 			state.orchestratorPaneId,
@@ -507,6 +548,7 @@ async function resumeTeam(pi: ExtensionAPI, ctx: ExtensionContext, taskName: str
 				state.orchestratorPaneId = await cmuxGetPaneId();
 				return state.orchestratorPaneId;
 			},
+			sessionFile ?? undefined,
 		);
 
 		if (surfaceId) {
@@ -709,6 +751,7 @@ async function spawnAgent(
 	task: string,
 	paneId?: string | null,
 	resolvePaneId?: () => Promise<string | null>,
+	sessionFile?: string,
 ): Promise<{ surfaceId: string | null }> {
 	// Generate context temp file
 	const tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-team-"));
@@ -745,6 +788,7 @@ async function spawnAgent(
 
 	// Build the pi command
 	const args: string[] = [];
+	if (sessionFile) args.push("--session", sessionFile);
 	if (agent.model) args.push("--model", agent.model);
 	if (agent.tools && agent.tools.length > 0 && !agent.tools.includes("all")) {
 		args.push("--tools", agent.tools.join(","));
@@ -1112,6 +1156,7 @@ export default function teamExtension(pi: ExtensionAPI) {
 							state.orchestratorPaneId = await cmuxGetPaneId();
 							return state.orchestratorPaneId;
 						},
+						loadAgentSessionMeta(ctx.cwd, task, rosterEntry.name) ?? undefined,
 					);
 
 					if (surfaceId) {
@@ -1382,6 +1427,41 @@ export default function teamExtension(pi: ExtensionAPI) {
 	// ─── Session start: restore state ─────────────────────────────────────
 
 	pi.on("session_start", async (_event, ctx) => {
+		// Check for pending team resume (set by /team resume before switchSession)
+		const resumeTask = loadSessionTask(ctx);
+		if (resumeTask) {
+			const state = loadState(ctx.cwd, resumeTask);
+			const PENDING_RESUME_EXPIRY_MS = 5 * 60 * 1000; // 5 minutes
+
+			if (state?.pendingTeamResume) {
+				const elapsed = Date.now() - state.pendingTeamResume;
+				if (elapsed > PENDING_RESUME_EXPIRY_MS) {
+					// Flag is stale (pi likely crashed between /team resume and switchSession)
+					state.pendingTeamResume = undefined;
+					saveState(ctx.cwd, state);
+					// Fall through to normal session_start logic
+				} else {
+					// Clear the flag
+					state.pendingTeamResume = undefined;
+					saveState(ctx.cwd, state);
+
+					// Perform the actual resume (repair state, re-spawn workers)
+					const resumed = await resumeTeam(pi, ctx, resumeTask);
+					if (resumed) currentTeamState = resumed;
+
+					// Update orchestrator session meta (new session file after switchSession)
+					if (ctx.sessionManager?.getSessionFile) {
+						const newSessionFile = ctx.sessionManager.getSessionFile();
+						if (newSessionFile) {
+							saveAgentSessionMeta(ctx.cwd, resumeTask, "orchestrator", newSessionFile);
+						}
+					}
+
+					return; // Skip the rest of session_start logic
+				}
+			}
+		}
+
 		// Path 1: Worker with env vars (set by spawn)
 		const envTask = process.env.PI_TEAM_TASK;
 		const envRole = process.env.PI_TEAM_ROLE;
@@ -1392,6 +1472,15 @@ export default function teamExtension(pi: ExtensionAPI) {
 			setupMailboxWatching(pi, ctx, envTask, envRole);
 			pi.setSessionName(`⚪ ${envRole}: ${envTask}`);
 			ctx.ui.notify(`Team session: ${envRole} for ${envTask}`, "info");
+
+			// Save session file path for resume
+			if (ctx.sessionManager?.getSessionFile) {
+				const sessionFile = ctx.sessionManager.getSessionFile();
+				if (sessionFile) {
+					saveAgentSessionMeta(ctx.cwd, envTask, envRole, sessionFile);
+				}
+			}
+
 			return;
 		}
 
@@ -1595,8 +1684,10 @@ export default function teamExtension(pi: ExtensionAPI) {
 					// Create workflow directory structure
 					const dir = workflowDir(ctx.cwd, taskName);
 					const mdir = mailboxDir(ctx.cwd, taskName);
+					const sdir = agentSessionDir(ctx.cwd, taskName);
 					fs.mkdirSync(dir, { recursive: true });
 					fs.mkdirSync(mdir, { recursive: true });
+					fs.mkdirSync(sdir, { recursive: true });
 
 					// Initialize mailbox files
 					for (const agent of roster) {
@@ -1668,6 +1759,14 @@ export default function teamExtension(pi: ExtensionAPI) {
 					const orchLabel = `🔷 orchestrator: ${taskName}`;
 					pi.setSessionName(orchLabel);
 					await cmuxRenameTab(undefined, orchLabel);
+
+					// Save orchestrator session file for resume
+					if (ctx.sessionManager?.getSessionFile) {
+						const orchSession = ctx.sessionManager.getSessionFile();
+						if (orchSession) {
+							saveAgentSessionMeta(ctx.cwd, taskName, "orchestrator", orchSession);
+						}
+					}
 
 					const agentList = roster.map((a) => `  🔵 ${a.name} — ${a.description}`).join("\n");
 					ctx.ui.notify(`Team initialized for "${taskName}"\nAgents:\n${agentList}\n\nDispatch agents using team_orchestrate or use /team redo to re-dispatch.`, "info");
@@ -1796,6 +1895,7 @@ export default function teamExtension(pi: ExtensionAPI) {
 								state.orchestratorPaneId = await cmuxGetPaneId();
 								return state.orchestratorPaneId;
 							},
+							loadAgentSessionMeta(ctx.cwd, taskName, rosterEntry.name) ?? undefined,
 						);
 
 						if (surfaceId) {
@@ -1883,8 +1983,25 @@ export default function teamExtension(pi: ExtensionAPI) {
 						return;
 					}
 
-					const resumed = await resumeTeam(pi, ctx, taskName);
-					if (resumed) currentTeamState = resumed;
+					// Try to load orchestrator session for conversation history restoration
+					const orchSessionFile = loadAgentSessionMeta(ctx.cwd, taskName, "orchestrator");
+					if (orchSessionFile) {
+						// Set pending flag so session_start auto-resumes after switchSession
+						const state = loadState(ctx.cwd, taskName);
+						if (state) {
+							state.pendingTeamResume = Date.now();
+							saveState(ctx.cwd, state);
+						}
+
+						// Switch to the old session — this loads full conversation history
+						// and triggers session_start, which detects pendingTeamResume and calls resumeTeam()
+						await ctx.switchSession(orchSessionFile);
+						return; // switchSession may not return normally
+					} else {
+						// No saved session file — fall back to direct resume (no history)
+						const resumed = await resumeTeam(pi, ctx, taskName);
+						if (resumed) currentTeamState = resumed;
+					}
 					break;
 				}
 
