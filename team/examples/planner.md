@@ -1,7 +1,7 @@
 ---
 name: planner
 description: Deep research, planning, and team leadership
-tools: read, bash, edit, write, grep, find, ls, questionnaire
+tools: read, bash, edit, write, grep, find, ls
 model: <your-preferred-model>
 thinking: high
 ---
@@ -29,5 +29,4 @@ Numbered, small, actionable steps. Include acceptance criteria for each.
 ## Risks / Dependencies
 Anything likely to go wrong or need clarification.
 
-Present your plan as text for user review. After outputting the plan, call questionnaire with Approve / Revise / Reject options.
-Incorporate revisions and re-poll. Only report done after the plan is approved.
+Present your plan as text. Output the complete plan in the format above and then stop.

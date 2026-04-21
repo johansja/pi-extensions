@@ -999,9 +999,8 @@ function processOrchestratorMailbox(
 				}
 				saveState(ctx.cwd, state);
 
-				const stopReason = report.stopReason ?? "unknown";
 				const resultPreview = (report.result ?? "No result provided").substring(0, 200);
-				parts.push(`**Agent "${msg.from}" ended (${stopReason}):** ${resultPreview}`);
+				parts.push(`Agent "${msg.from}" completed: ${resultPreview}`);
 			}
 		} else if (msg.type === "shutdown") {
 			// Orchestrator receiving a shutdown notice (rare — mostly agent→orchestrator)
@@ -1015,13 +1014,7 @@ function processOrchestratorMailbox(
 		updateTeamWidget(ctx, state);
 
 		// Send a user message to trigger the orchestrator's next turn
-		let reason = "Agent update";
-		if (messages.some(m => m.type === "message")) {
-			reason = "Agent sent a message";
-		}
-		const fullMessage = parts.length > 0
-			? `🔄 Team update: ${reason}\n\n${parts.join("\n\n")}`
-			: `🔄 Team update: ${reason}`;
+		const fullMessage = parts.join("\n\n");
 		pi.sendUserMessage(fullMessage, { deliverAs: "followUp" });
 	}
 }
@@ -1038,7 +1031,8 @@ function processWorkerMailbox(
 			if (msg.dispatchId) {
 				activeDispatches.set(`${task}/${role}`, msg.dispatchId);
 			}
-			pi.sendUserMessage(msg.instructions ?? msg.body ?? "New task from orchestrator", { deliverAs: "followUp" });
+			const dispatchText = msg.instructions ?? msg.body ?? "New task from orchestrator";
+			pi.sendUserMessage(`Agent "orchestrator": ${dispatchText}`, { deliverAs: "followUp" });
 		} else if (msg.type === "shutdown") {
 			ctx.ui.notify("🛑 Shutdown requested by orchestrator. Wrapping up.", "info");
 		}
