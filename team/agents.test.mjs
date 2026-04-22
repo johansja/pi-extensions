@@ -83,8 +83,6 @@ function loadAgentsFromDir(dir, source) {
 			.map((t) => t.trim().toLowerCase())
 			.filter(Boolean);
 
-		const approvalRequired = frontmatter.approvalRequired === "true" || frontmatter.approvalRequired === true;
-
 		agents.push({
 			name: frontmatter.name,
 			description: frontmatter.description,
@@ -92,7 +90,6 @@ function loadAgentsFromDir(dir, source) {
 			roles: roles && roles.length > 0 ? roles : undefined,
 			model: frontmatter.model,
 			thinking: frontmatter.thinking,
-			approvalRequired,
 			systemPrompt: body,
 			source,
 			filePath,

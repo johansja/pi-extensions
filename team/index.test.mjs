@@ -163,14 +163,13 @@ function buildOrchestratorContext(state, extraInfo) {
 	for (const agent of state.agents) {
 		const status = state.agentStatus[agent.name] ?? "idle";
 		const icon = statusIcon(status);
-		const needsApproval = agent.approvalRequired ? " (requires approval)" : "";
 		const toolsLabel = agent.tools && agent.tools.length > 0
 			? ` [tools: ${agent.tools.join(", ")}]`
 			: "";
 		const rolesLabel = agent.roles && agent.roles.length > 0
 			? ` [roles: ${agent.roles.join(", ")}]`
 			: "";
-		lines.push(`  ${icon} ${agent.name} (${status})${needsApproval}${toolsLabel}${rolesLabel} — ${agent.description}`);
+		lines.push(`  ${icon} ${agent.name} (${status})${toolsLabel}${rolesLabel} — ${agent.description}`);
 	}
 	lines.push("");
 

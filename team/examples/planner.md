@@ -5,7 +5,6 @@ tools: read, grep, find, ls
 roles: planning
 model: <your-preferred-model>
 thinking: high
-approvalRequired: true
 ---
 
 You are a **planning specialist**. Research the codebase and produce a concrete, actionable implementation plan.
