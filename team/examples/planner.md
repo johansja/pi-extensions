@@ -1,7 +1,8 @@
 ---
 name: planner
 description: Deep research, planning, and team leadership
-tools: read, bash, edit, write, grep, find, ls
+tools: read, grep, find, ls
+roles: planning
 model: <your-preferred-model>
 thinking: high
 approvalRequired: true

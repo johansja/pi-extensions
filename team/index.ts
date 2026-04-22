@@ -714,7 +714,7 @@ function updateTeamWidget(ctx: ExtensionContext, state: TeamState): void {
 		const status = state.agentStatus[agent.name] ?? "idle";
 		const icon = statusIcon(status);
 		const toolsLabel = agent.tools && agent.tools.length > 0
-			? ` [${agent.tools.includes("all") ? "*" : agent.tools.join(", ")}]`
+			? ` [${agent.tools.join(", ")}]`
 			: "";
 		lines.push(`   ${icon} ${agent.name} (${status})${toolsLabel}`);
 	}
@@ -727,49 +727,34 @@ function updateTeamWidget(ctx: ExtensionContext, state: TeamState): void {
 }
 
 /**
- * Infer an agent's role category from its name and description.
+ * Get an agent's explicit role categories from its `roles` frontmatter field.
  * Returns a set of role tags like "planning", "review", "implementation", "research".
  */
-function inferAgentRoles(name: string, description: string): Set<string> {
-	const roles = new Set<string>();
-	const text = `${name} ${description}`.toLowerCase();
-
-	// Planning keywords
-	if (/\b(planner|planning|plan|architect|strategy|strategist|design|lead)\b/.test(text)) {
-		roles.add("planning");
-	}
-	// Review keywords
-	if (/\b(reviewer|review|audit|inspect|quality|qa|critic|checker)\b/.test(text)) {
-		roles.add("review");
-	}
-	// Implementation keywords
-	if (/\b(worker|implement|build|code|develop|execute|doer|coder|engineer)\b/.test(text)) {
-		roles.add("implementation");
-	}
-	// Research keywords
-	if (/\b(researcher|research|investigate|explore|analyze|analysis)\b/.test(text)) {
-		roles.add("research");
-	}
-	// Testing keywords
-	if (/\b(tester|testing|test|qa|verify|validation)\b/.test(text)) {
-		roles.add("testing");
-	}
-
-	return roles;
+function getAgentRoles(agent: AgentRosterEntry): Set<string> {
+	return new Set(agent.roles ?? []);
 }
 
 /**
  * Build delegation constraints based on available agent roles.
  * Returns lines that tell the orchestrator what NOT to do itself.
  */
+const VALID_ROLES = ["planning", "research", "implementation", "review", "testing"];
+
 function buildDelegationRules(agents: AgentRosterEntry[]): string[] {
 	const roleToAgents = new Map<string, string[]>();
 
 	for (const agent of agents) {
-		const roles = inferAgentRoles(agent.name, agent.description);
-		for (const role of roles) {
-			if (!roleToAgents.has(role)) roleToAgents.set(role, []);
-			roleToAgents.get(role)!.push(agent.name);
+		const roles = getAgentRoles(agent);
+		if (roles.size > 0) {
+			const unknownRoles = Array.from(roles).filter(r => !VALID_ROLES.includes(r));
+			if (unknownRoles.length > 0) {
+				safeLog("warn", `team: agent ${agent.name} has unrecognized roles: ${unknownRoles.join(", ")}`);
+			}
+			const validRoles = Array.from(roles).filter(r => VALID_ROLES.includes(r));
+			for (const role of validRoles) {
+				if (!roleToAgents.has(role)) roleToAgents.set(role, []);
+				roleToAgents.get(role)!.push(agent.name);
+			}
 		}
 	}
 
@@ -812,9 +797,12 @@ function buildOrchestratorContext(state: TeamState, extraInfo?: string): string 
 		const icon = statusIcon(status);
 		const needsApproval = agent.approvalRequired ? " (requires approval)" : "";
 		const toolsLabel = agent.tools && agent.tools.length > 0
-			? ` [tools: ${agent.tools.includes("all") ? "all" : agent.tools.join(", ")}]`
+			? ` [tools: ${agent.tools.join(", ")}]`
 			: "";
-		lines.push(`  ${icon} ${agent.name} (${status})${needsApproval}${toolsLabel} — ${agent.description}`);
+		const rolesLabel = agent.roles && agent.roles.length > 0
+			? ` [roles: ${agent.roles.join(", ")}]`
+			: "";
+		lines.push(`  ${icon} ${agent.name} (${status})${needsApproval}${toolsLabel}${rolesLabel} — ${agent.description}`);
 	}
 
 	lines.push("");
@@ -927,8 +915,16 @@ async function spawnAgent(
 		const isResume = sessionFile ? sessionFileHasData(sessionFile) : false;
 		if (sessionFile) args.push("--session", sessionFile);
 		if (agent.model) args.push("--model", agent.model);
-		if (agent.tools && agent.tools.length > 0 && !agent.tools.includes("all")) {
-			args.push("--tools", agent.tools.join(","));
+		const validToolNames = new Set(["read", "bash", "edit", "write", "grep", "find", "ls"]);
+		if (agent.tools && agent.tools.length > 0) {
+			const invalidTools = agent.tools.filter(t => !validToolNames.has(t));
+			if (invalidTools.length > 0) {
+				safeLog("warn", `team: agent ${agent.name} has unknown tool names: ${invalidTools.join(", ")}`);
+			}
+			const validTools = agent.tools.filter(t => validToolNames.has(t));
+			if (validTools.length > 0) {
+				args.push("--tools", validTools.join(","));
+			}
 		}
 		if (agent.thinking) args.push("--thinking", agent.thinking);
 		args.push("--append-system-prompt", agent.filePath);
@@ -1868,7 +1864,7 @@ export default function teamExtension(pi: ExtensionAPI) {
 						const surface = state.surfaceIds[agent.name] ? ` (surface: ${state.surfaceIds[agent.name]})` : "";
 						const needsApproval = agent.approvalRequired ? " (requires approval)" : "";
 						const toolsLabel = agent.tools && agent.tools.length > 0
-							? ` [tools: ${agent.tools.includes("all") ? "all" : agent.tools.join(", ")}]`
+							? ` [tools: ${agent.tools.join(", ")}]`
 							: "";
 						lines.push(`  ${icon} ${agent.name} — ${status}${surface}${needsApproval}${toolsLabel}`);
 					}
@@ -2075,9 +2071,7 @@ export default function teamExtension(pi: ExtensionAPI) {
 						const source = agent.source === "user" ? "👤" : "📁";
 						const model = agent.model ? ` [${agent.model}]` : "";
 						const tools = agent.tools
-							? agent.tools.includes("all")
-								? " (tools: all)"
-								: ` (tools: ${agent.tools.join(", ")})`
+							? ` (tools: ${agent.tools.join(", ")})`
 							: "";
 						const approval = agent.approvalRequired ? " (requires approval)" : "";
 						lines.push(`  ${source} ${agent.name}${model}${tools}${approval}`);

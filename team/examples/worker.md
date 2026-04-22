@@ -1,7 +1,7 @@
 ---
 name: worker
 description: Implements the plan, executes tasks, and verifies results
-tools: read, bash, edit, write, grep, find, ls
+roles: implementation
 model: <your-preferred-model>
 thinking: medium
 ---

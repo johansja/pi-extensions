@@ -73,20 +73,26 @@ function loadAgentsFromDir(dir, source) {
 			continue;
 		}
 
-		const toolsRaw = frontmatter.tools?.trim().toLowerCase();
-		const tools = toolsRaw === "all" || toolsRaw === "*"
-			? ["all"]
-			: toolsRaw
-				?.split(",")
-				.map((t) => t.trim())
-				.filter(Boolean);
+		const tools = frontmatter.tools
+			?.split(",")
+			.map((t) => t.trim())
+			.filter(Boolean);
+
+		const roles = frontmatter.roles
+			?.split(",")
+			.map((t) => t.trim().toLowerCase())
+			.filter(Boolean);
+
+		const approvalRequired = frontmatter.approvalRequired === "true" || frontmatter.approvalRequired === true;
 
 		agents.push({
 			name: frontmatter.name,
 			description: frontmatter.description,
 			tools: tools && tools.length > 0 ? tools : undefined,
+			roles: roles && roles.length > 0 ? roles : undefined,
 			model: frontmatter.model,
 			thinking: frontmatter.thinking,
+			approvalRequired,
 			systemPrompt: body,
 			source,
 			filePath,
@@ -153,6 +159,7 @@ describe("loadAgentsFromDir", () => {
 		assert.equal(agents[0].thinking, "high");
 		assert.equal(agents[0].source, "project");
 		assert.ok(agents[0].filePath.endsWith("planner.md"));
+		assert.equal(agents[0].roles, undefined);
 	});
 
 	it("parses tools field", () => {
@@ -168,7 +175,84 @@ describe("loadAgentsFromDir", () => {
 		assert.deepEqual(worker.tools, ["read", "bash"]);
 	});
 
-	it("handles tools: all", () => {
+	it("parses roles field", () => {
+		writeAgentFile(tmpDir, "scout.md", {
+			name: "scout",
+			description: "Researches things",
+			roles: "research",
+		});
+
+		const agents = loadAgentsFromDir(tmpDir, "project");
+		const scout = agents.find((a) => a.name === "scout");
+		assert.ok(scout);
+		assert.deepEqual(scout.roles, ["research"]);
+	});
+
+	it("parses multiple roles", () => {
+		writeAgentFile(tmpDir, "hybrid.md", {
+			name: "hybrid",
+			description: "Does many things",
+			roles: "research, planning",
+		});
+
+		const agents = loadAgentsFromDir(tmpDir, "project");
+		const hybrid = agents.find((a) => a.name === "hybrid");
+		assert.ok(hybrid);
+		assert.deepEqual(hybrid.roles, ["research", "planning"]);
+	});
+
+	it("normalizes roles to lowercase", () => {
+		writeAgentFile(tmpDir, "mixed.md", {
+			name: "mixed",
+			description: "Mixed case roles",
+			roles: "Research, Planning",
+		});
+
+		const agents = loadAgentsFromDir(tmpDir, "project");
+		const mixed = agents.find((a) => a.name === "mixed");
+		assert.ok(mixed);
+		assert.deepEqual(mixed.roles, ["research", "planning"]);
+	});
+
+	it("handles testing role", () => {
+		writeAgentFile(tmpDir, "tester.md", {
+			name: "tester",
+			description: "Tests things",
+			roles: "testing",
+		});
+
+		const agents = loadAgentsFromDir(tmpDir, "project");
+		const tester = agents.find((a) => a.name === "tester");
+		assert.ok(tester);
+		assert.deepEqual(tester.roles, ["testing"]);
+	});
+
+	it("handles missing roles field", () => {
+		writeAgentFile(tmpDir, "noroles.md", {
+			name: "noroles",
+			description: "No roles defined",
+		});
+
+		const agents = loadAgentsFromDir(tmpDir, "project");
+		const agent = agents.find((a) => a.name === "noroles");
+		assert.ok(agent);
+		assert.equal(agent.roles, undefined);
+	});
+
+	it("handles empty roles field", () => {
+		writeAgentFile(tmpDir, "emptyroles.md", {
+			name: "emptyroles",
+			description: "Empty roles",
+			roles: "",
+		});
+
+		const agents = loadAgentsFromDir(tmpDir, "project");
+		const agent = agents.find((a) => a.name === "emptyroles");
+		assert.ok(agent); // agent is created, roles just becomes undefined
+		assert.equal(agent.roles, undefined);
+	});
+
+	it("does not special-case tools: all", () => {
 		writeAgentFile(tmpDir, "super.md", {
 			name: "super",
 			description: "All tools",
@@ -181,7 +265,7 @@ describe("loadAgentsFromDir", () => {
 		assert.deepEqual(superAgent.tools, ["all"]);
 	});
 
-	it("handles tools: *", () => {
+	it("does not special-case tools: *", () => {
 		writeAgentFile(tmpDir, "wildcard.md", {
 			name: "wildcard",
 			description: "Wildcard tools",
@@ -191,7 +275,7 @@ describe("loadAgentsFromDir", () => {
 		const agents = loadAgentsFromDir(tmpDir, "project");
 		const w = agents.find((a) => a.name === "wildcard");
 		assert.ok(w);
-		assert.deepEqual(w.tools, ["all"]);
+		assert.deepEqual(w.tools, ["*"]);
 	});
 
 	it("skips files missing required fields", () => {

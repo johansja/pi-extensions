@@ -104,37 +104,24 @@ function statusIcon(status) {
 	}
 }
 
-function inferAgentRoles(name, description) {
-	const roles = new Set();
-	const text = `${name} ${description}`.toLowerCase();
+const VALID_ROLES = ["planning", "research", "implementation", "review", "testing"];
 
-	if (/\b(planner|planning|plan|architect|strategy|strategist|design|lead)\b/.test(text)) {
-		roles.add("planning");
-	}
-	if (/\b(reviewer|review|audit|inspect|quality|qa|critic|checker)\b/.test(text)) {
-		roles.add("review");
-	}
-	if (/\b(worker|implement|build|code|develop|execute|doer|coder|engineer)\b/.test(text)) {
-		roles.add("implementation");
-	}
-	if (/\b(researcher|research|investigate|explore|analyze|analysis)\b/.test(text)) {
-		roles.add("research");
-	}
-	if (/\b(tester|testing|test|qa|verify|validation)\b/.test(text)) {
-		roles.add("testing");
-	}
-
-	return roles;
+function getAgentRoles(agent) {
+	return new Set(agent.roles ?? []);
 }
 
 function buildDelegationRules(agents) {
 	const roleToAgents = new Map();
 
 	for (const agent of agents) {
-		const roles = inferAgentRoles(agent.name, agent.description);
-		for (const role of roles) {
-			if (!roleToAgents.has(role)) roleToAgents.set(role, []);
-			roleToAgents.get(role).push(agent.name);
+		const roles = getAgentRoles(agent);
+		if (roles.size > 0) {
+			const unknownRoles = Array.from(roles).filter(r => !VALID_ROLES.includes(r));
+			const validRoles = Array.from(roles).filter(r => VALID_ROLES.includes(r));
+			for (const role of validRoles) {
+				if (!roleToAgents.has(role)) roleToAgents.set(role, []);
+				roleToAgents.get(role).push(agent.name);
+			}
 		}
 	}
 
@@ -176,7 +163,14 @@ function buildOrchestratorContext(state, extraInfo) {
 	for (const agent of state.agents) {
 		const status = state.agentStatus[agent.name] ?? "idle";
 		const icon = statusIcon(status);
-		lines.push(`  ${icon} ${agent.name} (${status}) — ${agent.description}`);
+		const needsApproval = agent.approvalRequired ? " (requires approval)" : "";
+		const toolsLabel = agent.tools && agent.tools.length > 0
+			? ` [tools: ${agent.tools.join(", ")}]`
+			: "";
+		const rolesLabel = agent.roles && agent.roles.length > 0
+			? ` [roles: ${agent.roles.join(", ")}]`
+			: "";
+		lines.push(`  ${icon} ${agent.name} (${status})${needsApproval}${toolsLabel}${rolesLabel} — ${agent.description}`);
 	}
 	lines.push("");
 
@@ -197,7 +191,7 @@ function buildOrchestratorContext(state, extraInfo) {
 	}
 	if (agentsWithResults.size > 0) {
 		for (const [agentName, results] of agentsWithResults) {
-			const summary = results.map((r, i) => `#${i + 1}: ${r.substring(0, 100)}${r.length > 100 ? "..." : ""}`).join("; ");
+			const summary = results.map((r, i) => `#${i + 1}: ${r}`).join("; ");
 			lines.push(`- ${agentName}: ${summary}`);
 		}
 	} else {
@@ -404,31 +398,30 @@ describe("statusIcon", () => {
 	});
 });
 
-describe("inferAgentRoles", () => {
-	it("detects planner from name", () => {
-		const roles = inferAgentRoles("planner", "description");
+describe("getAgentRoles", () => {
+	it("returns explicit roles from agent config", () => {
+		const roles = getAgentRoles({ name: "planner", description: "Plans things", roles: ["planning"] });
 		assert.deepEqual(roles, new Set(["planning"]));
 	});
 
-	it("detects reviewer from name", () => {
-		const roles = inferAgentRoles("reviewer", "description");
-		assert.deepEqual(roles, new Set(["review"]));
+	it("returns multiple explicit roles", () => {
+		const roles = getAgentRoles({ name: "hybrid", description: "Does many things", roles: ["research", "planning"] });
+		assert.deepEqual(roles, new Set(["research", "planning"]));
 	});
 
-	it("detects worker from name", () => {
-		const roles = inferAgentRoles("worker", "description");
-		assert.deepEqual(roles, new Set(["implementation"]));
+	it("returns empty set when roles is missing", () => {
+		const roles = getAgentRoles({ name: "foobar", description: "does something random" });
+		assert.deepEqual(roles, new Set());
 	});
 
-	it("detects multiple roles from name + description", () => {
-		const roles = inferAgentRoles("fullstack", "Build and review code");
-		assert.ok(roles.has("implementation"));
-		assert.ok(roles.has("review"));
+	it("returns empty set when roles is empty array", () => {
+		const roles = getAgentRoles({ name: "empty", description: "No roles", roles: [] });
+		assert.deepEqual(roles, new Set());
 	});
 
-	it("returns empty set for unknown role", () => {
-		const roles = inferAgentRoles("foobar", "does something random");
-		assert.equal(roles.size, 0);
+	it("does not infer roles from name/description", () => {
+		const roles = getAgentRoles({ name: "planner", description: "planning specialist" });
+		assert.deepEqual(roles, new Set());
 	});
 });
 
@@ -437,10 +430,19 @@ describe("buildDelegationRules", () => {
 		assert.deepEqual(buildDelegationRules([]), []);
 	});
 
-	it("includes rules for planner+worker", () => {
+	it("returns empty array when no roles defined", () => {
 		const agents = [
 			{ name: "planner", description: "Plans things" },
 			{ name: "worker", description: "Does things" },
+		];
+		const rules = buildDelegationRules(agents);
+		assert.deepEqual(rules, []);
+	});
+
+	it("includes rules for agents with explicit roles", () => {
+		const agents = [
+			{ name: "planner", description: "Plans things", roles: ["planning"] },
+			{ name: "worker", description: "Does things", roles: ["implementation"] },
 		];
 		const rules = buildDelegationRules(agents);
 		assert.ok(rules.some((r) => r.includes("plan")));
@@ -449,8 +451,26 @@ describe("buildDelegationRules", () => {
 		assert.ok(rules.some((r) => r.includes("worker")));
 	});
 
+	it("ignores unrecognized roles", () => {
+		const agents = [
+			{ name: "custom", description: "Custom role", roles: ["unknown-role"] },
+		];
+		const rules = buildDelegationRules(agents);
+		assert.deepEqual(rules, []);
+	});
+
+	it("filters out unrecognized roles but keeps valid ones", () => {
+		const agents = [
+			{ name: "hybrid", description: "Mixed roles", roles: ["planning", "unknown-role", "research"] },
+		];
+		const rules = buildDelegationRules(agents);
+		assert.ok(rules.some((r) => r.includes("plan")));
+		assert.ok(rules.some((r) => r.includes("research")));
+		assert.ok(!rules.some((r) => r.includes("unknown-role")));
+	});
+
 	it("ends with guidance phrase", () => {
-		const agents = [{ name: "planner", description: "Plans" }];
+		const agents = [{ name: "planner", description: "Plans", roles: ["planning"] }];
 		const rules = buildDelegationRules(agents);
 		const last = rules[rules.length - 1];
 		assert.ok(last.includes("Your ONLY job is to"));
@@ -462,8 +482,8 @@ describe("buildOrchestratorContext", () => {
 		return {
 			task: "test-task",
 			agents: [
-				{ name: "planner", description: "Plans things" },
-				{ name: "worker", description: "Does things" },
+				{ name: "planner", description: "Plans things", roles: ["planning"] },
+				{ name: "worker", description: "Does things", roles: ["implementation"] },
 			],
 			agentStatus: { planner: "idle", worker: "working" },
 			dispatchHistory: dispatches,
@@ -477,6 +497,12 @@ describe("buildOrchestratorContext", () => {
 		assert.ok(ctx.includes("worker"));
 		assert.ok(ctx.includes("idle"));
 		assert.ok(ctx.includes("working"));
+	});
+
+	it("includes role labels in roster", () => {
+		const ctx = buildOrchestratorContext(makeState());
+		assert.ok(ctx.includes("[roles: planning]"));
+		assert.ok(ctx.includes("[roles: implementation]"));
 	});
 
 	it("includes delegation rules when agents have roles", () => {

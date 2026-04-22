@@ -21,6 +21,7 @@ export interface AgentConfig {
 	name: string;
 	description: string;
 	tools?: string[];
+	roles?: string[];
 	model?: string;
 	thinking?: string;
 	approvalRequired?: boolean;
@@ -66,13 +67,15 @@ function loadAgentsFromDir(dir: string, source: "user" | "project"): AgentConfig
 			continue;
 		}
 
-		const toolsRaw = frontmatter.tools?.trim().toLowerCase();
-		const tools = toolsRaw === "all" || toolsRaw === "*"
-			? ["all"]
-			: toolsRaw
-				?.split(",")
-				.map((t: string) => t.trim())
-				.filter(Boolean);
+		const tools = frontmatter.tools
+			?.split(",")
+			.map((t: string) => t.trim())
+			.filter(Boolean);
+
+		const roles = frontmatter.roles
+			?.split(",")
+			.map((t: string) => t.trim().toLowerCase())
+			.filter(Boolean);
 
 		const approvalRequired = frontmatter.approvalRequired === "true" || frontmatter.approvalRequired === true;
 
@@ -80,6 +83,7 @@ function loadAgentsFromDir(dir: string, source: "user" | "project"): AgentConfig
 			name: frontmatter.name,
 			description: frontmatter.description,
 			tools: tools && tools.length > 0 ? tools : undefined,
+			roles: roles && roles.length > 0 ? roles : undefined,
 			model: frontmatter.model,
 			thinking: frontmatter.thinking,
 			approvalRequired,

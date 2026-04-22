@@ -1,7 +1,8 @@
 ---
 name: reviewer
 description: Code review specialist — scrutinizes implementation quality and correctness
-tools: read, bash, edit, write, grep, find, ls
+tools: read, grep, find, ls, bash
+roles: review
 model: <your-preferred-model>
 thinking: high
 ---
