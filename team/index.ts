@@ -37,6 +37,7 @@ const execFileAsync = promisify(execFile);
 
 // ─── Module-level state ───────────────────────────────────────────────────
 
+let savedOriginalTools: string[] | null = null;
 const activeWatchers: (fs.FSWatcher | NodeJS.Timeout)[] = [];
 const spawnedTempDirs: string[] = [];
 const activeDispatches = new Map<string, string>(); // key: `${task}/${role}`
@@ -1552,6 +1553,16 @@ export default function teamExtension(pi: ExtensionAPI) {
 			}
 		}
 
+		// Restore original tools if orchestrator was restricted
+		if (currentTeamState && savedOriginalTools) {
+			try {
+				pi.setActiveTools(savedOriginalTools);
+				savedOriginalTools = null;
+			} catch (e) {
+				safeLog("warn", `team: failed to restore original tools: ${e}`);
+			}
+		}
+
 		// Nullify module-level state so it doesn't leak into future sessions
 		currentTeamState = null;
 		currentWorkerState = null;
@@ -1785,6 +1796,15 @@ export default function teamExtension(pi: ExtensionAPI) {
 						if (orchSession) {
 							saveAgentSessionMeta(ctx.cwd, taskName, "orchestrator", orchSession);
 						}
+					}
+
+					// Restrict orchestrator to pure dispatcher — only team_orchestrate
+					try {
+						savedOriginalTools = pi.getActiveTools();
+						pi.setActiveTools(["team_orchestrate"]);
+						ctx.ui.notify("🔒 Orchestrator tools restricted to team_orchestrate only.", "info");
+					} catch (e) {
+						safeLog("warn", `team: failed to restrict orchestrator tools: ${e}`);
 					}
 
 					const agentList = roster.map((a) => `  🔵 ${a.name} — ${a.description}`).join("\n");
@@ -2147,6 +2167,17 @@ export default function teamExtension(pi: ExtensionAPI) {
 								await cmuxCloseSurface(surfaceId).catch(() => {});
 							}
 						} catch { /* best effort */ }
+
+						// Restore original tools if this was the currently active orchestrator team
+						if (currentTeamState?.task === targetTeam && savedOriginalTools) {
+							try {
+								pi.setActiveTools(savedOriginalTools);
+								savedOriginalTools = null;
+								currentTeamState = null;
+							} catch (e) {
+								safeLog("warn", `team: failed to restore original tools on cleanup: ${e}`);
+							}
+						}
 
 						await fs.promises.rm(teamDir, { recursive: true, force: true });
 						ctx.ui.notify(`🧹 Cleaned up team "${targetTeam}"${projectLabel}`, "info");
