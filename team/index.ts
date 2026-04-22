@@ -26,7 +26,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { SessionManager, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext } from "@mariozechner/pi-coding-agent";
+import { isToolCallEventType, SessionManager, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { StringEnum } from "@mariozechner/pi-ai";
 import { Type } from "@sinclair/typebox";
 import { discoverAgents, type AgentConfig } from "./agents.js";
@@ -529,7 +529,7 @@ function buildResumeContext(state: TeamState): string {
 	return lines.join("\n");
 }
 
-async function resumeTeam(pi: ExtensionAPI, ctx: ExtensionContext, taskName: string): Promise<TeamState | null> {
+async function resumeTeam(pi: ExtensionAPI, ctx: ExtensionContext, taskName: string, onAgentComplete?: () => void): Promise<TeamState | null> {
 	const state = loadState(ctx.cwd, taskName);
 	if (!state) {
 		ctx.ui.notify(`No workflow state found for "${taskName}"`, "error");
@@ -625,7 +625,7 @@ async function resumeTeam(pi: ExtensionAPI, ctx: ExtensionContext, taskName: str
 	}
 
 	// Set up mailbox watching
-	setupMailboxWatching(pi, ctx, taskName, "orchestrator");
+	setupMailboxWatching(pi, ctx, taskName, "orchestrator", onAgentComplete);
 
 	// Re-resolve orchestrator pane ID
 	state.orchestratorPaneId = await cmuxGetPaneId();
@@ -747,7 +747,7 @@ function buildOrchestratorContext(state: TeamState, extraInfo?: string): string 
 	lines.push("**Rules:**");
 	lines.push("- NEVER do research, planning, coding, reviewing, or testing yourself.");
 	lines.push("- If you catch yourself thinking through a problem or analyzing files directly — STOP and call team_orchestrate.");
-	lines.push("- Dispatch ONE agent at a time. After dispatching, end your turn and wait. You will be re-invoked when the agent finishes. Do not write a response in the meantime.");
+	lines.push("- Dispatch ONE agent at a time. After dispatching, STOP and wait. You will be re-invoked when they finish.");
 	lines.push("- When an agent finishes, briefly note their result, then dispatch the next agent. Do NOT re-analyze or re-review their work.");
 	lines.push("- Your ONLY allowed tool is team_orchestrate.");
 	lines.push("");
@@ -927,7 +927,7 @@ function processOrchestratorMailbox(
 	ctx: ExtensionContext,
 	task: string,
 	messages: TeamMessage[],
-): void {
+): boolean {
 	const state = loadState(ctx.cwd, task);
 	if (!state) return;
 
@@ -982,10 +982,14 @@ function processOrchestratorMailbox(
 	}
 
 	if (hasActionableMessage) {
+		safeLog("debug", `[TEAM ORCH] Sending followUp with ${parts.length} message(s)`);
 		// Send a user message to trigger the orchestrator's next turn
 		const fullMessage = parts.join("\n\n");
 		pi.sendUserMessage(fullMessage, { deliverAs: "followUp" });
+	} else {
+		safeLog("debug", `[TEAM ORCH] No actionable messages in mailbox`);
 	}
+	return hasActionableMessage;
 }
 
 function processWorkerMailbox(
@@ -999,8 +1003,10 @@ function processWorkerMailbox(
 		if (msg.type === "dispatch") {
 			if (msg.dispatchId) {
 				activeDispatches.set(`${task}/${role}`, msg.dispatchId);
+				safeLog("debug", `[TEAM WORKER] Set activeDispatch for ${task}/${role} = ${msg.dispatchId}`);
 			}
 			const dispatchText = msg.instructions ?? msg.body ?? "New task from orchestrator";
+			safeLog("debug", `[TEAM WORKER] ${role} received dispatch, sending user message`);
 			pi.sendUserMessage(`Received message from "orchestrator":\n\n${dispatchText}`, { deliverAs: "followUp" });
 		} else if (msg.type === "shutdown") {
 			ctx.ui.notify("🛑 Shutdown requested by orchestrator. Wrapping up.", "info");
@@ -1013,6 +1019,7 @@ function setupMailboxWatching(
 	ctx: ExtensionContext,
 	task: string,
 	role: string,
+	onAgentComplete?: () => void,
 ): void {
 	const mp = mailboxPath(ctx.cwd, task, role);
 
@@ -1037,7 +1044,8 @@ function setupMailboxWatching(
 			if (messages.length === 0) return;
 
 			if (role === "orchestrator") {
-				processOrchestratorMailbox(pi, ctx, task, messages);
+				const hadResult = processOrchestratorMailbox(pi, ctx, task, messages);
+				if (hadResult) onAgentComplete?.();
 			} else {
 				processWorkerMailbox(pi, ctx, task, role, messages);
 			}
@@ -1054,7 +1062,8 @@ function setupMailboxWatching(
 	const existingMessages = readMailbox(mp, ctx);
 	if (existingMessages.length > 0) {
 		if (role === "orchestrator") {
-			processOrchestratorMailbox(pi, ctx, task, existingMessages);
+			const hadResult = processOrchestratorMailbox(pi, ctx, task, existingMessages);
+			if (hadResult) onAgentComplete?.();
 		} else {
 			processWorkerMailbox(pi, ctx, task, role, existingMessages);
 		}
@@ -1115,6 +1124,8 @@ async function discoverProjectCWDs(currentCwd: string): Promise<string[]> {
 export default function teamExtension(pi: ExtensionAPI) {
 	let currentTeamState: TeamState | null = null;
 	let currentWorkerState: WorkerState | null = null;
+	let orchestratorWaitingFor: string | null = null; // agent name when tool is hidden
+	let dispatchAllowedInTurn = true; // per-turn gate — reset each turn_start
 
 
 	// ─── team_orchestrate tool (orchestrator only) ────────────────────────
@@ -1123,11 +1134,10 @@ export default function teamExtension(pi: ExtensionAPI) {
 		pi.registerTool({
 			name: "team_orchestrate",
 		label: "Orchestrate Team",
-		description: "Dispatch an agent with a task. End your turn after calling this tool.",
+		description: "Dispatch an agent with a task. Use this to delegate work to a specific team agent.",
 		promptSnippet: "Dispatch an agent with instructions",
 		promptGuidelines: [
 			"Use team_orchestrate when you need to assign work to a team agent.",
-			"End your turn after calling this tool.",
 		],
 		parameters: Type.Object({
 			action: StringEnum(["dispatch"] as const, {
@@ -1243,11 +1253,15 @@ export default function teamExtension(pi: ExtensionAPI) {
 				saveState(ctx.cwd, state);
 				currentTeamState = state;
 
+				orchestratorWaitingFor = params.agent;
+				pi.setActiveTools([]);
+
 				return {
 					content: [{
 						type: "text",
-						text: `✅ Dispatched "${params.agent}" with instructions.\n\nThe agent is now running in the background. End your turn here — do not summarize, plan, or assume the agent's result. Wait until the system re-invokes you with their response.`,
+						text: `Dispatched "${params.agent}" with instructions.`,
 					}],
+					details: { dispatchedTo: params.agent },
 				};
 			}
 
@@ -1265,9 +1279,15 @@ export default function teamExtension(pi: ExtensionAPI) {
 			return text;
 		},
 		renderResult(result, { expanded }, theme, context) {
-			let text = result.isError
-				? theme.fg("error", "✗ Error")
-				: theme.fg("success", "↻ Dispatched");
+			const agentName = (result.details as { dispatchedTo?: string } | undefined)?.dispatchedTo;
+			let text: string;
+			if (result.isError) {
+				text = theme.fg("error", "✗ Error");
+			} else if (agentName) {
+				text = theme.fg("success", `↻ Dispatched → ${agentName}`);
+			} else {
+				text = theme.fg("success", "↻ Dispatched");
+			}
 			if (expanded && result.content[0]) {
 				text += "\n  " + theme.fg("dim", (result.content[0] as { text: string }).text.substring(0, 200));
 			}
@@ -1298,7 +1318,10 @@ export default function teamExtension(pi: ExtensionAPI) {
 					saveState(ctx.cwd, state);
 
 					// Perform the actual resume (repair state, re-spawn workers)
-					const resumed = await resumeTeam(pi, ctx, resumeTask);
+					const resumed = await resumeTeam(pi, ctx, resumeTask, () => {
+						orchestratorWaitingFor = null;
+						pi.setActiveTools(["team_orchestrate"]);
+					});
 					if (resumed) currentTeamState = resumed;
 
 					// Update orchestrator session meta (new session file after switchSession)
@@ -1385,9 +1408,11 @@ export default function teamExtension(pi: ExtensionAPI) {
 		// Only report if there's an active dispatch. If user typed in the surface
 		// without a pending dispatch, skip reporting to avoid noise.
 		if (!dispatchId) {
+			safeLog("debug", `[TEAM WORKER] agent_end skipped: no active dispatch for ${task}/${role}`);
 			currentWorkerState = null;
 			return;
 		}
+		safeLog("debug", `[TEAM WORKER] agent_end reporting: dispatchId=${dispatchId}`);
 
 		// Update dispatch history if we can find a matching entry
 		if (dispatchId) {
@@ -1415,6 +1440,7 @@ export default function teamExtension(pi: ExtensionAPI) {
 
 		// Write result to orchestrator mailbox ALWAYS
 		const orchestratorMailbox = mailboxPath(ctx.cwd, task, "orchestrator");
+		safeLog("debug", `[TEAM WORKER] Writing result to ${orchestratorMailbox}`);
 		appendToMailbox(orchestratorMailbox, {
 			type: "message",
 			from: role,
@@ -1436,6 +1462,31 @@ export default function teamExtension(pi: ExtensionAPI) {
 			currentWorkerState = null;
 		}
 		activeDispatches.delete(`${task}/${role}`);
+	});
+
+	// ─── Per-turn dispatch gate: prevent parallel dispatches in the same turn ─
+	pi.on("turn_start", async (_event, _ctx) => {
+		dispatchAllowedInTurn = true;
+	});
+
+	// ─── Safety net: block team_orchestrate while waiting for an agent ────
+	pi.on("tool_call", async (event, _ctx) => {
+		if (event.toolName !== "team_orchestrate") return;
+
+		if (!dispatchAllowedInTurn) {
+			return {
+				block: true,
+				reason: `🛑 DISPATCH BLOCKED: team_orchestrate was already called this turn. Only ONE dispatch allowed per turn. The previously dispatched agent is running. Wait — you will be re-invoked automatically.`,
+			};
+		}
+		dispatchAllowedInTurn = false;
+
+		if (orchestratorWaitingFor) {
+			return {
+				block: true,
+				reason: `🛑 DISPATCH BLOCKED: "${orchestratorWaitingFor}" is still running. Wait for their result before dispatching again. You will be re-invoked automatically.`,
+			};
+		}
 	});
 
 	// ─── Session shutdown: cleanup resources ────────────────────────────────
@@ -1477,6 +1528,7 @@ export default function teamExtension(pi: ExtensionAPI) {
 		// Nullify module-level state so it doesn't leak into future sessions
 		currentTeamState = null;
 		currentWorkerState = null;
+		orchestratorWaitingFor = null;
 		activeDispatches.clear();
 	});
 
@@ -1646,7 +1698,10 @@ export default function teamExtension(pi: ExtensionAPI) {
 					saveSessionState(pi, currentTeamState);
 
 					// Start watching orchestrator mailbox
-					setupMailboxWatching(pi, ctx, taskName, "orchestrator");
+					setupMailboxWatching(pi, ctx, taskName, "orchestrator", () => {
+						orchestratorWaitingFor = null;
+						pi.setActiveTools(["team_orchestrate"]);
+					});
 
 					// Resolve orchestrator pane ID if not yet known
 					if (!currentTeamState.orchestratorPaneId) {
