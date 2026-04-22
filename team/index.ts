@@ -982,12 +982,9 @@ function processOrchestratorMailbox(
 	}
 
 	if (hasActionableMessage) {
-		safeLog("debug", `[TEAM ORCH] Sending followUp with ${parts.length} message(s)`);
 		// Send a user message to trigger the orchestrator's next turn
 		const fullMessage = parts.join("\n\n");
 		pi.sendUserMessage(fullMessage, { deliverAs: "followUp" });
-	} else {
-		safeLog("debug", `[TEAM ORCH] No actionable messages in mailbox`);
 	}
 	return hasActionableMessage;
 }
@@ -1003,10 +1000,8 @@ function processWorkerMailbox(
 		if (msg.type === "dispatch") {
 			if (msg.dispatchId) {
 				activeDispatches.set(`${task}/${role}`, msg.dispatchId);
-				safeLog("debug", `[TEAM WORKER] Set activeDispatch for ${task}/${role} = ${msg.dispatchId}`);
 			}
 			const dispatchText = msg.instructions ?? msg.body ?? "New task from orchestrator";
-			safeLog("debug", `[TEAM WORKER] ${role} received dispatch, sending user message`);
 			pi.sendUserMessage(`Received message from "orchestrator":\n\n${dispatchText}`, { deliverAs: "followUp" });
 		} else if (msg.type === "shutdown") {
 			ctx.ui.notify("🛑 Shutdown requested by orchestrator. Wrapping up.", "info");
@@ -1408,11 +1403,9 @@ export default function teamExtension(pi: ExtensionAPI) {
 		// Only report if there's an active dispatch. If user typed in the surface
 		// without a pending dispatch, skip reporting to avoid noise.
 		if (!dispatchId) {
-			safeLog("debug", `[TEAM WORKER] agent_end skipped: no active dispatch for ${task}/${role}`);
 			currentWorkerState = null;
 			return;
 		}
-		safeLog("debug", `[TEAM WORKER] agent_end reporting: dispatchId=${dispatchId}`);
 
 		// Update dispatch history if we can find a matching entry
 		if (dispatchId) {
@@ -1440,7 +1433,6 @@ export default function teamExtension(pi: ExtensionAPI) {
 
 		// Write result to orchestrator mailbox ALWAYS
 		const orchestratorMailbox = mailboxPath(ctx.cwd, task, "orchestrator");
-		safeLog("debug", `[TEAM WORKER] Writing result to ${orchestratorMailbox}`);
 		appendToMailbox(orchestratorMailbox, {
 			type: "message",
 			from: role,
