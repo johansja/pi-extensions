@@ -907,14 +907,6 @@ async function spawnAgent(
 			`- Workflow directory: \`.pi/workflow/${task}/\``,
 			`- Your mailbox: \`.pi/workflow/${task}/mailbox/${agent.name}.json\``,
 			``,
-			`## Available Tools`,
-			``,
-			...(agent.tools && agent.tools.length > 0
-				? (agent.tools.includes("all")
-					? ["All tools available."]
-					: agent.tools.map(t => `- \`${t}\``))
-				: ["All built-in tools available."]),
-			``,
 			`## Communication Protocol`,
 			``,
 			`All communication routes through the orchestrator — you never talk directly to other agents.`,
