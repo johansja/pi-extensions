@@ -686,6 +686,12 @@ async function resumeTeam(pi: ExtensionAPI, ctx: ExtensionContext, taskName: str
 	ctx.ui.notify(`Team "${taskName}" resumed. ${state.agents.length} agents re-spawned.`, "info");
 	await cmuxLog("info", `Team "${taskName}" resumed with ${state.agents.length} agents`);
 
+	// Re-apply orchestrator tool restriction for resumed sessions
+	if (!savedOriginalTools) {
+		savedOriginalTools = pi.getActiveTools();
+	}
+	pi.setActiveTools(["team_orchestrate"]);
+
 	return state;
 }
 
@@ -707,7 +713,10 @@ function updateTeamWidget(ctx: ExtensionContext, state: TeamState): void {
 	for (const agent of state.agents) {
 		const status = state.agentStatus[agent.name] ?? "idle";
 		const icon = statusIcon(status);
-		lines.push(`   ${icon} ${agent.name} (${status})`);
+		const toolsLabel = agent.tools && agent.tools.length > 0
+			? ` [${agent.tools.includes("all") ? "*" : agent.tools.join(", ")}]`
+			: "";
+		lines.push(`   ${icon} ${agent.name} (${status})${toolsLabel}`);
 	}
 
 	lines.push("");
@@ -802,7 +811,10 @@ function buildOrchestratorContext(state: TeamState, extraInfo?: string): string 
 		const status = state.agentStatus[agent.name] ?? "idle";
 		const icon = statusIcon(status);
 		const needsApproval = agent.approvalRequired ? " (requires approval)" : "";
-		lines.push(`  ${icon} ${agent.name} (${status})${needsApproval} — ${agent.description}`);
+		const toolsLabel = agent.tools && agent.tools.length > 0
+			? ` [tools: ${agent.tools.includes("all") ? "all" : agent.tools.join(", ")}]`
+			: "";
+		lines.push(`  ${icon} ${agent.name} (${status})${needsApproval}${toolsLabel} — ${agent.description}`);
 	}
 
 	lines.push("");
@@ -894,6 +906,14 @@ async function spawnAgent(
 			``,
 			`- Workflow directory: \`.pi/workflow/${task}/\``,
 			`- Your mailbox: \`.pi/workflow/${task}/mailbox/${agent.name}.json\``,
+			``,
+			`## Available Tools`,
+			``,
+			...(agent.tools && agent.tools.length > 0
+				? (agent.tools.includes("all")
+					? ["All tools available."]
+					: agent.tools.map(t => `- \`${t}\``))
+				: ["All built-in tools available."]),
 			``,
 			`## Communication Protocol`,
 			``,
@@ -1577,6 +1597,16 @@ export default function teamExtension(pi: ExtensionAPI) {
 	pi.on("before_agent_start", async (event, ctx) => {
 		// Only inject for orchestrator sessions
 		if (!currentTeamState) return;
+
+		// Safety: ensure orchestrator remains a pure dispatcher
+		if (savedOriginalTools) {
+			const activeTools = pi.getActiveTools();
+			const isRestricted = activeTools.length === 1 && activeTools[0] === "team_orchestrate";
+			if (!isRestricted) {
+				pi.setActiveTools(["team_orchestrate"]);
+			}
+		}
+
 		const task = currentTeamState.task;
 
 		const state = loadState(ctx.cwd, task);
@@ -1845,7 +1875,10 @@ export default function teamExtension(pi: ExtensionAPI) {
 						const icon = statusIcon(status);
 						const surface = state.surfaceIds[agent.name] ? ` (surface: ${state.surfaceIds[agent.name]})` : "";
 						const needsApproval = agent.approvalRequired ? " (requires approval)" : "";
-						lines.push(`  ${icon} ${agent.name} — ${status}${surface}${needsApproval}`);
+						const toolsLabel = agent.tools && agent.tools.length > 0
+							? ` [tools: ${agent.tools.includes("all") ? "all" : agent.tools.join(", ")}]`
+							: "";
+						lines.push(`  ${icon} ${agent.name} — ${status}${surface}${needsApproval}${toolsLabel}`);
 					}
 
 					// Reports
