@@ -36,7 +36,6 @@ const execFileAsync = promisify(execFile);
 
 // ─── Module-level state ───────────────────────────────────────────────────
 
-let savedOriginalTools: string[] | null = null;
 const activeWatchers: (fs.FSWatcher | NodeJS.Timeout)[] = [];
 const spawnedTempDirs: string[] = [];
 const activeDispatches = new Map<string, string>(); // key: `${task}/${role}`
@@ -660,6 +659,8 @@ async function resumeTeam(pi: ExtensionAPI, ctx: ExtensionContext, taskName: str
 	pi.setSessionName(orchLabel);
 	await cmuxRenameTab(undefined, orchLabel);
 
+	ensureResearchTools();
+
 	// Store resume context as system-level info (not a user message) to avoid re-execution
 	const resumeContext = buildResumeContext(state);
 	state.pendingResumeContext = resumeContext;
@@ -1112,6 +1113,15 @@ export default function teamExtension(pi: ExtensionAPI) {
 	let orchestratorWaitingFor: string | null = null; // agent name when tool is hidden
 	let dispatchAllowedInTurn = true; // per-turn gate — reset each turn_start
 
+	function ensureResearchTools(): void {
+		const researchTools = ["grep", "find", "ls"];
+		const current = pi.getActiveTools();
+		const missing = researchTools.filter((t) => !current.includes(t));
+		if (missing.length > 0) {
+			pi.setActiveTools([...current, ...missing]);
+		}
+	}
+
 
 	// ─── team_orchestrate tool (orchestrator only) ────────────────────────
 	const isWorkerProcess = process.env.PI_TEAM_ROLE && process.env.PI_TEAM_ROLE !== "orchestrator";
@@ -1238,11 +1248,7 @@ export default function teamExtension(pi: ExtensionAPI) {
 				saveState(ctx.cwd, state);
 				currentTeamState = state;
 
-				if (!savedOriginalTools) {
-					savedOriginalTools = pi.getActiveTools();
-				}
 				orchestratorWaitingFor = params.agent;
-				pi.setActiveTools([]);
 
 				return {
 					content: [{
@@ -1308,9 +1314,6 @@ export default function teamExtension(pi: ExtensionAPI) {
 					// Perform the actual resume (repair state, re-spawn workers)
 					const resumed = await resumeTeam(pi, ctx, resumeTask, () => {
 						orchestratorWaitingFor = null;
-						if (savedOriginalTools) {
-							pi.setActiveTools(savedOriginalTools);
-						}
 					});
 					if (resumed) currentTeamState = resumed;
 
@@ -1502,16 +1505,6 @@ export default function teamExtension(pi: ExtensionAPI) {
 			}
 		}
 
-		// Restore original tools if orchestrator was restricted
-		if (currentTeamState && savedOriginalTools) {
-			try {
-				pi.setActiveTools(savedOriginalTools);
-				savedOriginalTools = null;
-			} catch (e) {
-				safeLog("warn", `team: failed to restore original tools: ${e}`);
-			}
-		}
-
 		// Nullify module-level state so it doesn't leak into future sessions
 		currentTeamState = null;
 		currentWorkerState = null;
@@ -1678,9 +1671,6 @@ export default function teamExtension(pi: ExtensionAPI) {
 					// Start watching orchestrator mailbox
 					setupMailboxWatching(pi, ctx, taskName, "orchestrator", () => {
 						orchestratorWaitingFor = null;
-						if (savedOriginalTools) {
-							pi.setActiveTools(savedOriginalTools);
-						}
 					});
 
 					// Resolve orchestrator pane ID if not yet known
@@ -1724,6 +1714,7 @@ export default function teamExtension(pi: ExtensionAPI) {
 					}
 
 					const agentList = roster.map((a) => `  🔵 ${a.name} — ${a.description}`).join("\n");
+					ensureResearchTools();
 					ctx.ui.notify(`Team initialized for "${taskName}"\nAgents:\n${agentList}\n\nDispatch agents using team_orchestrate.`, "info");
 					await cmuxLog("info", `Team initialized for ${taskName} with agents: ${roster.map((a) => a.name).join(", ")}`);
 					break;
@@ -1984,15 +1975,8 @@ export default function teamExtension(pi: ExtensionAPI) {
 							}
 						} catch { /* best effort */ }
 
-						// Restore original tools if this was the currently active orchestrator team
-						if (currentTeamState?.task === targetTeam && savedOriginalTools) {
-							try {
-								pi.setActiveTools(savedOriginalTools);
-								savedOriginalTools = null;
-								currentTeamState = null;
-							} catch (e) {
-								safeLog("warn", `team: failed to restore original tools on cleanup: ${e}`);
-							}
+						if (currentTeamState?.task === targetTeam) {
+							currentTeamState = null;
 						}
 
 						await fs.promises.rm(teamDir, { recursive: true, force: true });
