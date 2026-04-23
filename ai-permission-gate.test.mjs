@@ -161,6 +161,49 @@ describe("parseVerdict", () => {
 });
 
 describe("consistency with source file", () => {
+	it("references PI_AI_PERM_GATE_MAX_TOKENS env var", () => {
+		assert.match(extensionSource, /PI_AI_PERM_GATE_MAX_TOKENS/);
+	});
+
+	it("references PI_AI_PERM_GATE_TEMPERATURE env var", () => {
+		assert.match(extensionSource, /PI_AI_PERM_GATE_TEMPERATURE/);
+	});
+
+	it("completeSimple call includes maxTokens or options spread", () => {
+		// Verify options are forwarded inside the completeSimple call
+		assert.match(extensionSource, /completeSimple\([^)]*\{[^}]*\.{3}\s*options[^}]*\}/s);
+	});
+
+	it("readPermissionGateMaxTokens function exists", () => {
+		assert.match(extensionSource, /function readPermissionGateMaxTokens/);
+	});
+
+	it("readPermissionGateTemperature function exists", () => {
+		assert.match(extensionSource, /function readPermissionGateTemperature/);
+	});
+
+	it("maxTokens uses env var || settings.json reader fallback", () => {
+		// Handler should reference both the env var and the read function
+		assert.match(extensionSource, /readPermissionGateMaxTokens/);
+		assert.match(extensionSource, /PI_AI_PERM_GATE_MAX_TOKENS/);
+	});
+
+	it("temperature uses env var || settings.json reader fallback", () => {
+		// Handler should reference both the env var and the read function
+		assert.match(extensionSource, /readPermissionGateTemperature/);
+		assert.match(extensionSource, /PI_AI_PERM_GATE_TEMPERATURE/);
+	});
+
+	it("readPermissionGateTimeout function exists", () => {
+		assert.match(extensionSource, /function readPermissionGateTimeout/);
+	});
+
+	it("timeout uses env var || settings.json reader fallback", () => {
+		// Handler should reference both the env var and the read function
+		assert.match(extensionSource, /readPermissionGateTimeout/);
+		assert.match(extensionSource, /PI_AI_PERM_GATE_TIMEOUT/);
+	});
+
 	it("RISK_LEVELS array matches the source file", () => {
 		// Extract RISK_LEVELS from the .ts source
 		const match = extensionSource.match(/const RISK_LEVELS\s*=\s*\[([^\]]+)\]/);

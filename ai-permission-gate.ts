@@ -15,14 +15,29 @@
  *   as less risky than system-wide equivalents. No post-check heuristics
  *   or risk-downgrading logic — the LLM makes CWD-aware judgments directly.
  *
- * Configuration via environment variables:
- *   PI_AI_PERM_GATE_MODEL       - Model for classification (format: "provider/modelId"). Overrides settings.json.
+ * Configuration (precedence: env var > settings.json > default):
+ *
+ *   ~/.pi/agent/settings.json "permissionGate" block:
+ *     {
+ *       "permissionGate": {
+ *         "model": "anthropic/claude-sonnet-4-5",
+ *         "blockLevel": "low",
+ *         "maxTokens": 128,
+ *         "temperature": 0,
+ *         "timeout": 10000
+ *       }
+ *     }
+ *
+ *   Environment variables (override settings.json):
+ *   PI_AI_PERM_GATE_MODEL       - Model for classification (format: "provider/modelId")
  *   PI_AI_PERM_GATE_BLOCK_LEVEL - Minimum risk level to block: "low" | "medium" | "high" (default: "low")
  *     "low"    = block on any risk (safest, most confirmations)
  *     "medium" = block on medium and high risk
  *     "high"   = only block on high risk (fewest confirmations)
  *   PI_AI_PERM_GATE_TIMEOUT     - Timeout in ms for the LLM call (default: 10000)
  *   PI_AI_PERM_GATE_FALLBACK    - What to do if LLM fails: "allow" | "block" | "confirm" (default: "confirm")
+ *   PI_AI_PERM_GATE_MAX_TOKENS  - Maximum tokens for the LLM classification call (default: 128)
+ *   PI_AI_PERM_GATE_TEMPERATURE - Sampling temperature for classification, e.g. 0 or 0.1 (optional)
  */
 
 import {
@@ -178,6 +193,48 @@ function readPermissionGateBlockLevel(cwd: string, agentDir: string): RiskLevel 
 }
 
 /**
+ * Read the permissionGate.maxTokens setting from settings.json.
+ * Returns undefined if not configured or not a number.
+ */
+function readPermissionGateMaxTokens(cwd: string, agentDir: string): number | undefined {
+	const settingsManager = SettingsManager.create(cwd, agentDir);
+	const globalSettings = settingsManager.getGlobalSettings() as Record<string, unknown>;
+	const gate = globalSettings.permissionGate as Record<string, unknown> | undefined;
+	if (gate && typeof gate.maxTokens === "number") {
+		return gate.maxTokens;
+	}
+	return undefined;
+}
+
+/**
+ * Read the permissionGate.temperature setting from settings.json.
+ * Returns undefined if not configured or not a number.
+ */
+function readPermissionGateTemperature(cwd: string, agentDir: string): number | undefined {
+	const settingsManager = SettingsManager.create(cwd, agentDir);
+	const globalSettings = settingsManager.getGlobalSettings() as Record<string, unknown>;
+	const gate = globalSettings.permissionGate as Record<string, unknown> | undefined;
+	if (gate && typeof gate.temperature === "number") {
+		return gate.temperature;
+	}
+	return undefined;
+}
+
+/**
+ * Read the permissionGate.timeout setting from settings.json.
+ * Returns undefined if not configured or not a number.
+ */
+function readPermissionGateTimeout(cwd: string, agentDir: string): number | undefined {
+	const settingsManager = SettingsManager.create(cwd, agentDir);
+	const globalSettings = settingsManager.getGlobalSettings() as Record<string, unknown>;
+	const gate = globalSettings.permissionGate as Record<string, unknown> | undefined;
+	if (gate && typeof gate.timeout === "number") {
+		return gate.timeout;
+	}
+	return undefined;
+}
+
+/**
  * Resolve a model from PI_AI_PERM_GATE_MODEL env var or settings.json.
  * Accepts "provider/modelId" format (e.g., "anthropic/claude-sonnet-4-5")
  * or a bare model id that's searched across providers.
@@ -238,6 +295,7 @@ async function classifyCommand(
 	apiKey: string | undefined,
 	timeout: number,
 	signal: AbortSignal | undefined,
+	options: { maxTokens?: number; temperature?: number },
 ): Promise<Verdict> {
 	// Fallback to process CWD if ctx.cwd is missing
 	if (!cwd) {
@@ -276,6 +334,7 @@ async function classifyCommand(
 
 	try {
 		const response = await completeSimple(model, context, {
+			...options,
 			apiKey,
 			signal: timeoutController.signal,
 		});
@@ -338,8 +397,23 @@ export default function (pi: ExtensionAPI) {
 		const blockLevel = (process.env.PI_AI_PERM_GATE_BLOCK_LEVEL as RiskLevel)
 			|| readPermissionGateBlockLevel(ctx.cwd, `${process.env.HOME}/.pi/agent`)
 			|| "low";
-		const timeout = parseInt(process.env.PI_AI_PERM_GATE_TIMEOUT || "10000", 10);
+		const timeoutSetting = readPermissionGateTimeout(ctx.cwd, `${process.env.HOME}/.pi/agent`);
+		const timeoutRaw = parseInt(
+			process.env.PI_AI_PERM_GATE_TIMEOUT || String(timeoutSetting ?? 10000),
+			10,
+		);
+		const timeout = Number.isNaN(timeoutRaw) ? 10000 : timeoutRaw;
 		const fallback = process.env.PI_AI_PERM_GATE_FALLBACK || "confirm";
+		const maxTokensSetting = readPermissionGateMaxTokens(ctx.cwd, `${process.env.HOME}/.pi/agent`);
+		const maxTokensRaw = parseInt(process.env.PI_AI_PERM_GATE_MAX_TOKENS || String(maxTokensSetting ?? 128), 10);
+		const maxTokens = Number.isNaN(maxTokensRaw) ? 128 : maxTokensRaw;
+		const temperatureSetting = readPermissionGateTemperature(ctx.cwd, `${process.env.HOME}/.pi/agent`);
+		const temperatureRaw = process.env.PI_AI_PERM_GATE_TEMPERATURE
+			? parseFloat(process.env.PI_AI_PERM_GATE_TEMPERATURE)
+			: temperatureSetting;
+		const temperature = temperatureRaw !== undefined && !Number.isNaN(temperatureRaw)
+			? temperatureRaw
+			: undefined;
 
 		let verdict: Verdict;
 		try {
@@ -356,7 +430,10 @@ export default function (pi: ExtensionAPI) {
 				throw new Error(`No API key for ${model.provider}/${model.id}: ${authResult.error}`);
 			}
 
-			verdict = await classifyCommand(command, ctx.cwd, model, authResult.apiKey, timeout, ctx.signal);
+			verdict = await classifyCommand(command, ctx.cwd, model, authResult.apiKey, timeout, ctx.signal, {
+				maxTokens,
+				...(temperature !== undefined && { temperature }),
+			});
 		} catch (err) {
 			// LLM call failed - log and use fallback strategy
 			const errDetail = err instanceof Error ? err.message : String(err);
