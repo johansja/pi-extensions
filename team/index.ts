@@ -739,7 +739,7 @@ function buildOrchestratorContext(state: TeamState, extraInfo?: string): string 
 	lines.push("**Rules:**");
 	lines.push("- You MAY research, read files, analyze code, and design solutions yourself.");
 	lines.push("- You MUST NOT implement code or run tests yourself — dispatch the worker or reviewer.");
-	lines.push("- Dispatch ONE agent at a time. After dispatching, STOP and wait. You will be re-invoked when they finish.");
+	lines.push("- Dispatch ONE agent at a time. After dispatching, the agent runs in the background. Their result will be delivered to you automatically when they finish.");
 	lines.push("- When an agent finishes, briefly note their result, then dispatch the next agent. Do NOT re-analyze or re-review their work.");
 	lines.push("");
 
@@ -1129,10 +1129,11 @@ export default function teamExtension(pi: ExtensionAPI) {
 		pi.registerTool({
 			name: "team_orchestrate",
 		label: "Orchestrate Team",
-		description: "Dispatch an agent with a task. Use this to delegate work to a specific team agent.",
+		description: "Dispatch an agent with a task. The agent runs in the background. Their result will be delivered to you automatically when they finish.",
 		promptSnippet: "Dispatch an agent with instructions",
 		promptGuidelines: [
 			"Use team_orchestrate when you need to assign work to a team agent.",
+			"After dispatching, the agent runs in the background. Their result will be delivered to you automatically. Do not re-dispatch the same agent for the same task.",
 		],
 		parameters: Type.Object({
 			action: StringEnum(["dispatch"] as const, {
@@ -1253,7 +1254,7 @@ export default function teamExtension(pi: ExtensionAPI) {
 				return {
 					content: [{
 						type: "text",
-						text: `Dispatched "${params.agent}" with instructions.`,
+						text: `Dispatched "${params.agent}" with instructions.\n\nThe agent is now running in the background. Their result will be delivered to you automatically when they finish. Do not dispatch them again for the same task.`,
 					}],
 					details: { dispatchedTo: params.agent },
 				};
