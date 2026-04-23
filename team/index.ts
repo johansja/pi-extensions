@@ -668,12 +668,6 @@ async function resumeTeam(pi: ExtensionAPI, ctx: ExtensionContext, taskName: str
 	ctx.ui.notify(`Team "${taskName}" resumed. ${state.agents.length} agents re-spawned.`, "info");
 	await cmuxLog("info", `Team "${taskName}" resumed with ${state.agents.length} agents`);
 
-	// Re-apply orchestrator tool restriction for resumed sessions
-	if (!savedOriginalTools) {
-		savedOriginalTools = pi.getActiveTools();
-	}
-	pi.setActiveTools(["team_orchestrate"]);
-
 	return state;
 }
 
@@ -848,8 +842,8 @@ async function spawnAgent(
 			``,
 			`1. **Wait for dispatch** — Do not start work yet. The task instructions will arrive as a dispatch message from the team lead.`,
 			`2. **Do your work** — Execute your responsibilities as defined by your role.`,
-			`3. **Report completion** — Your final response will be automatically sent to the orchestrator. Include a clear summary of your work.`,
-			`4. **Wait** — After reporting, wait for further instructions from the orchestrator.`,
+			`3. **Report completion** — Your final response will be automatically sent to the team lead. Include a clear summary of your work.`,
+			`4. **Wait** — After reporting, wait for further instructions from the team lead.`,
 		].join("\n");
 		await fs.promises.writeFile(contextFile, contextContent, { encoding: "utf-8", mode: 0o600 });
 
@@ -1147,7 +1141,7 @@ export default function teamExtension(pi: ExtensionAPI) {
 
 			if (!isOrchestrator) {
 				return {
-					content: [{ type: "text", text: "Only the orchestrator can use team_orchestrate." }],
+					content: [{ type: "text", text: "Only the team lead can use team_orchestrate." }],
 					isError: true,
 				};
 			}
