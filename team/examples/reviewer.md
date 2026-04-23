@@ -1,7 +1,7 @@
 ---
 name: reviewer
 description: Code review and testing specialist — scrutinizes quality, correctness, and test coverage
-tools: read, bash, edit, write, grep, find, ls
+tools: read, grep, find, ls
 roles: review, testing
 model: <your-preferred-model>
 thinking: high
