@@ -691,7 +691,7 @@ function getAgentRoles(agent: AgentRosterEntry): Set<string> {
  * Build delegation constraints based on available agent roles.
  * Returns lines that tell the orchestrator what NOT to do itself.
  */
-const VALID_ROLES = ["planning", "research", "implementation", "review", "testing"];
+const VALID_ROLES = ["implementation", "review"];
 
 function buildDelegationRules(agents: AgentRosterEntry[]): string[] {
 	const roleToAgents = new Map<string, string[]>();
@@ -717,11 +717,8 @@ function buildDelegationRules(agents: AgentRosterEntry[]): string[] {
 	rules.push("**Delegation Rules — You must NOT do these yourself, delegate them:**");
 
 	const roleDescriptions: Record<string, string> = {
-		planning: "Do NOT plan, architect, or design solutions — dispatch the planner",
-		review: "Do NOT review code, audit quality, or check correctness — dispatch the reviewer",
 		implementation: "Do NOT implement, code, or make changes — dispatch the worker",
-		research: "Do NOT research or investigate the codebase — dispatch the researcher",
-		testing: "Do NOT write or run tests — dispatch the tester",
+		review: "Do NOT review code, run tests, or audit quality — dispatch the reviewer",
 	};
 
 	for (const [role, agentNames] of roleToAgents) {
@@ -742,14 +739,13 @@ function buildOrchestratorContext(state: TeamState, extraInfo?: string): string 
 
 	// Behavioral instructions
 	lines.push("## Your Role");
-	lines.push("You are the **team orchestrator**. Your ONLY job is to decide which agent to dispatch next and pass them relevant context.");
+	lines.push("You are the **team lead**. Explore the codebase, plan solutions, and delegate execution to your team.");
 	lines.push("");
 	lines.push("**Rules:**");
-	lines.push("- NEVER do research, planning, coding, reviewing, or testing yourself.");
-	lines.push("- If you catch yourself thinking through a problem or analyzing files directly — STOP and call team_orchestrate.");
+	lines.push("- You MAY research, read files, analyze code, and design solutions yourself.");
+	lines.push("- You MUST NOT implement code or run tests yourself — dispatch the worker or reviewer.");
 	lines.push("- Dispatch ONE agent at a time. After dispatching, STOP and wait. You will be re-invoked when they finish.");
 	lines.push("- When an agent finishes, briefly note their result, then dispatch the next agent. Do NOT re-analyze or re-review their work.");
-	lines.push("- Your ONLY allowed tool is team_orchestrate.");
 	lines.push("");
 
 	// Agent roster
@@ -844,13 +840,13 @@ async function spawnAgent(
 			``,
 			`## Communication Protocol`,
 			``,
-			`All communication routes through the orchestrator — you never talk directly to other agents.`,
+			`All communication routes through the team lead — you never talk directly to other agents.`,
 			``,
-			`- **Communication**: All communication routes through the orchestrator.`,
+			`- **Communication**: All communication routes through the team lead.`,
 			``,
 			`## Handoff Protocol`,
 			``,
-			`1. **Wait for dispatch** — Do not start work yet. The task instructions will arrive as a dispatch message from the orchestrator.`,
+			`1. **Wait for dispatch** — Do not start work yet. The task instructions will arrive as a dispatch message from the team lead.`,
 			`2. **Do your work** — Execute your responsibilities as defined by your role.`,
 			`3. **Report completion** — Your final response will be automatically sent to the orchestrator. Include a clear summary of your work.`,
 			`4. **Wait** — After reporting, wait for further instructions from the orchestrator.`,
@@ -1248,6 +1244,9 @@ export default function teamExtension(pi: ExtensionAPI) {
 				saveState(ctx.cwd, state);
 				currentTeamState = state;
 
+				if (!savedOriginalTools) {
+					savedOriginalTools = pi.getActiveTools();
+				}
 				orchestratorWaitingFor = params.agent;
 				pi.setActiveTools([]);
 
@@ -1315,7 +1314,9 @@ export default function teamExtension(pi: ExtensionAPI) {
 					// Perform the actual resume (repair state, re-spawn workers)
 					const resumed = await resumeTeam(pi, ctx, resumeTask, () => {
 						orchestratorWaitingFor = null;
-						pi.setActiveTools(["team_orchestrate"]);
+						if (savedOriginalTools) {
+							pi.setActiveTools(savedOriginalTools);
+						}
 					});
 					if (resumed) currentTeamState = resumed;
 
@@ -1530,16 +1531,7 @@ export default function teamExtension(pi: ExtensionAPI) {
 		// Only inject for orchestrator sessions
 		if (!currentTeamState) return;
 
-		// Safety: ensure orchestrator remains a pure dispatcher
-		if (savedOriginalTools) {
-			const activeTools = pi.getActiveTools();
-			const isRestricted = activeTools.length === 1 && activeTools[0] === "team_orchestrate";
-			if (!isRestricted) {
-				pi.setActiveTools(["team_orchestrate"]);
-			}
-		}
-
-		const task = currentTeamState.task;
+			const task = currentTeamState.task;
 
 		const state = loadState(ctx.cwd, task);
 		if (!state) return;
@@ -1692,7 +1684,9 @@ export default function teamExtension(pi: ExtensionAPI) {
 					// Start watching orchestrator mailbox
 					setupMailboxWatching(pi, ctx, taskName, "orchestrator", () => {
 						orchestratorWaitingFor = null;
-						pi.setActiveTools(["team_orchestrate"]);
+						if (savedOriginalTools) {
+							pi.setActiveTools(savedOriginalTools);
+						}
 					});
 
 					// Resolve orchestrator pane ID if not yet known
@@ -1733,15 +1727,6 @@ export default function teamExtension(pi: ExtensionAPI) {
 						if (orchSession) {
 							saveAgentSessionMeta(ctx.cwd, taskName, "orchestrator", orchSession);
 						}
-					}
-
-					// Restrict orchestrator to pure dispatcher — only team_orchestrate
-					try {
-						savedOriginalTools = pi.getActiveTools();
-						pi.setActiveTools(["team_orchestrate"]);
-						ctx.ui.notify("🔒 Orchestrator tools restricted to team_orchestrate only.", "info");
-					} catch (e) {
-						safeLog("warn", `team: failed to restrict orchestrator tools: ${e}`);
 					}
 
 					const agentList = roster.map((a) => `  🔵 ${a.name} — ${a.description}`).join("\n");
