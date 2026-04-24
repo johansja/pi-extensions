@@ -33,47 +33,29 @@ Orchestrates multi-role development workflows across cmux panes. Each role (plan
 
 | Command | Description |
 |---|---|
-| `/team init <task>` | Create workflow, become orchestrator |
-| `/team spawn <role> <task>` | Spawn a role in a new cmux pane |
-| `/team status [task]` | Show workflow state |
-| `/team send <role> <task> <msg>` | Send a message to a role's mailbox |
-| `/team approve <task>` | Approve plan, advance to implementing |
-| `/team reject <task> <fb>` | Reject plan, send feedback to planner |
-| `/team redo <role> <task>` | Re-dispatch a role |
-| `/team shutdown [task]` | Graceful shutdown of all workers |
-| `/team auto` | Toggle auto-orchestration |
-| `/team history [task]` | Show phase transition history |
+| `/team init <task-name> [<agent>...]` | Create workflow, become orchestrator (omitting agents loads all) |
+| `/team status [task-name]` | Show workflow state |
+| `/team resume [task-name]` | Resume an interrupted team session |
+| `/team list` | List available agents |
+| `/team history [task-name]` | Show dispatch history |
+| `/team cleanup <team-name>` | Remove a team regardless of status |
 
-**Workflow phases:** `planning` → `plan-review` → `implementing` → `reviewing` → `fixing` → `final-review` → `done`
+**Workflow model:** LLM-driven orchestration. After `/team init`, you use the `team_orchestrate` tool to dispatch agents one at a time. The orchestrator (main pi session) decides what to run next based on agent results.
 
-**Install:** Symlink the `team/` directory into `~/.pi/agent/extensions/team/`.
-
-#### Agent Configuration
-
-The team extension discovers agent definitions from markdown files with YAML frontmatter. Copy the examples from `team/examples/` into `~/.pi/agent/team/` and customize them:
-
-```bash
-# Copy examples and edit with your model and preferences
-cp team/examples/*.md ~/.pi/agent/team/
-```
-
-Each agent file has this frontmatter:
+**Agent configuration:** Place `.md` files in `~/.pi/agent/team/` (user-level) or `.pi/team/` (project-level). Each file has YAML frontmatter:
 
 ```yaml
 ---
-name: planner           # Role name (planner, coder, reviewer)
-description: ...        # Short description
-tools: read, bash, ...  # Comma-separated tool whitelist
-model: <your-model>     # Model identifier for this role
-thinking: high          # Thinking level: low, medium, high
+name: reviewer
+description: Code review and testing specialist — scrutinizes quality, correctness, and test coverage
+tools: read, grep, find, ls
+roles: review, testing
+model: <your-preferred-model>
+thinking: high
 ---
 ```
 
-The body is the system prompt for that role. Key customization points:
-- **model**: Set to your preferred LLM (can differ per role)
-- **tools**: Restrict what each role can do (e.g., reviewer doesn't need `edit`/`write`)
-- **thinking**: Higher for planning/review, lower for coding
-- **System prompt**: Adjust responsibilities, rules, and deliverable format to your workflow
+See `team/examples/` for starter templates.
 
 ## Installation
 

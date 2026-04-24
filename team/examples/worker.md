@@ -28,3 +28,20 @@ What was done.
 
 ## Notes
 Additional context, blockers, follow-ups, or decisions.
+
+## Status Reporting
+
+When done, start your response with exactly one of:
+
+- **DONE** — Task complete, tests pass (if applicable), nothing left to do.
+- **DONE_WITH_CONCERNS** — Complete, but flag specific doubts.
+- **NEEDS_CONTEXT** — Missing information. Ask your specific question and stop.
+- **BLOCKED** — Cannot complete. Explain why.
+
+## Self-Review Checklist
+
+Before reporting done, verify:
+- [ ] All instructions implemented
+- [ ] Tests pass (run them if available)
+- [ ] No placeholders, TODOs, or commented-out code left
+- [ ] Follows project patterns and conventions
