@@ -734,7 +734,7 @@ function buildOrchestratorContext(state: TeamState, extraInfo?: string): string 
 
 	// Behavioral instructions
 	lines.push("## Your Role");
-	lines.push("You are the **team lead**. Explore the codebase, plan solutions, and delegate execution to your team.");
+	lines.push("You are the **orchestrator**. Explore the codebase, plan solutions, and delegate execution to your team.");
 	lines.push("");
 	lines.push("**Rules:**");
 	lines.push("- You MAY research, read files, analyze code, and design solutions yourself.");
@@ -835,16 +835,16 @@ async function spawnAgent(
 			``,
 			`## Communication Protocol`,
 			``,
-			`All communication routes through the team lead — you never talk directly to other agents.`,
+			`All communication routes through the orchestrator — you never talk directly to other agents.`,
 			``,
-			`- **Communication**: All communication routes through the team lead.`,
+			`- **Communication**: All communication routes through the orchestrator.`,
 			``,
 			`## Handoff Protocol`,
 			``,
-			`1. **Wait for dispatch** — Do not start work yet. The task instructions will arrive as a dispatch message from the team lead.`,
+			`1. **Wait for dispatch** — Do not start work yet. The task instructions will arrive as a dispatch message from the orchestrator.`,
 			`2. **Do your work** — Execute your responsibilities as defined by your role.`,
-			`3. **Report completion** — Your final response will be automatically sent to the team lead. Include a clear summary of your work.`,
-			`4. **Wait** — After reporting, wait for further instructions from the team lead.`,
+			`3. **Report completion** — Your final response will be automatically sent to the orchestrator. Include a clear summary of your work.`,
+			`4. **Wait** — After reporting, wait for further instructions from the orchestrator.`,
 		].join("\n");
 		await fs.promises.writeFile(contextFile, contextContent, { encoding: "utf-8", mode: 0o600 });
 
@@ -920,7 +920,7 @@ function processOrchestratorMailbox(
 	messages: TeamMessage[],
 ): boolean {
 	const state = loadState(ctx.cwd, task);
-	if (!state) return;
+	if (!state) return false;
 
 	// Process each message and build combined context
 	const parts: string[] = [];
@@ -1152,7 +1152,7 @@ export default function teamExtension(pi: ExtensionAPI) {
 
 			if (!isOrchestrator) {
 				return {
-					content: [{ type: "text", text: "Only the team lead can use team_orchestrate." }],
+					content: [{ type: "text", text: "Only the orchestrator can use team_orchestrate." }],
 					isError: true,
 				};
 			}
