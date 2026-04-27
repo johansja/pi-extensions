@@ -1061,6 +1061,9 @@ function setupMailboxWatching(
 		const watcher = fs.watch(mp, () => {
 			processMessages();
 		});
+		watcher.on("error", (err) => {
+			safeLog("debug", `team: mailbox watcher error: ${err.message}`);
+		});
 
 		activeWatchers.push(watcher);
 	} catch (e) {
@@ -1967,17 +1970,29 @@ export default function teamExtension(pi: ExtensionAPI) {
 							break;
 						}
 
-						// Close cmux surfaces before deletion (best effort)
-						try {
-							const content = fs.readFileSync(path.join(teamDir, "state.json"), "utf-8");
-							const state = JSON.parse(content);
-							for (const surfaceId of Object.values(state.surfaceIds ?? {})) {
-								await cmuxCloseSurface(surfaceId).catch(() => {});
-							}
-						} catch { /* best effort */ }
-
-						if (currentTeamState?.task === targetTeam) {
+						// If cleaning up the currently active team, tear down watchers and surfaces first.
+						// For old teams, DO NOT close surfaces from stale state.json — cmux
+						// may have reused those surface IDs, and closing them could kill an
+						// unrelated tab (including the orchestrator's own session).
+						const isCurrentTeam = currentTeamState?.task === targetTeam || currentWorkerState?.task === targetTeam;
+						if (isCurrentTeam) {
+							clearMailboxWatchers();
 							currentTeamState = null;
+							currentWorkerState = null;
+							orchestratorWaitingFor = null;
+							activeDispatches.clear();
+
+							// Only close surfaces for the ACTIVE team (where IDs are current).
+							// Verify each surface still exists before closing.
+							try {
+								const content = fs.readFileSync(path.join(teamDir, "state.json"), "utf-8");
+								const state = JSON.parse(content);
+								for (const surfaceId of Object.values(state.surfaceIds ?? {})) {
+									if (typeof surfaceId === "string" && await cmuxSurfaceExists(surfaceId)) {
+										await cmuxCloseSurface(surfaceId).catch(() => {});
+									}
+								}
+							} catch { /* best effort */ }
 						}
 
 						await fs.promises.rm(teamDir, { recursive: true, force: true });
