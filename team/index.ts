@@ -739,7 +739,7 @@ function buildOrchestratorContext(state: TeamState, extraInfo?: string): string 
 	lines.push("**Rules:**");
 	lines.push("- You MAY research, read files, analyze code, and design solutions yourself.");
 	lines.push("- You MUST NOT implement code or run tests yourself — dispatch the worker or reviewer.");
-	lines.push("- Dispatch ONE agent at a time. After dispatching, the agent runs in the background. Their result will be delivered to you automatically when they finish.");
+	lines.push("- You can send additional instructions to an agent that is still running. Do NOT dispatch a different agent until the current one reports back.");
 	lines.push("- When an agent finishes, briefly note their result, then dispatch the next agent. Do NOT re-analyze or re-review their work.");
 	lines.push("");
 
@@ -1475,10 +1475,10 @@ export default function teamExtension(pi: ExtensionAPI) {
 		}
 		dispatchAllowedInTurn = false;
 
-		if (orchestratorWaitingFor) {
+		if (orchestratorWaitingFor && event.input.agent !== orchestratorWaitingFor) {
 			return {
 				block: true,
-				reason: `🛑 DISPATCH BLOCKED: "${orchestratorWaitingFor}" is still running. Wait for their result before dispatching again. You will be re-invoked automatically.`,
+				reason: `"${orchestratorWaitingFor}" is still running. Wait for their result before dispatching a different agent. You can send additional instructions to the same agent if needed.`,
 			};
 		}
 	});

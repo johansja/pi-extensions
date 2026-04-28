@@ -537,3 +537,34 @@ describe("buildOrchestratorContext", () => {
 		assert.ok(ctx.includes("No completed work yet"));
 	});
 });
+
+// ─── Inline dispatch blocking logic (from tool_call hook) ─────────────────
+
+function checkDispatchBlock(orchestratorWaitingFor, requestedAgent) {
+	if (orchestratorWaitingFor && requestedAgent !== orchestratorWaitingFor) {
+		return {
+			block: true,
+			reason: `"${orchestratorWaitingFor}" is still running. Wait for their result before dispatching a different agent. You can send additional instructions to the same agent if needed.`,
+		};
+	}
+	return { block: false };
+}
+
+describe("dispatch blocking", () => {
+	it("blocks dispatching a different agent while waiting", () => {
+		const result = checkDispatchBlock("worker", "reviewer");
+		assert.equal(result.block, true);
+		assert.ok(result.reason.includes("worker"));
+		assert.ok(result.reason.includes("different agent"));
+	});
+
+	it("allows dispatching the same agent while waiting (steering)", () => {
+		const result = checkDispatchBlock("worker", "worker");
+		assert.equal(result.block, false);
+	});
+
+	it("allows dispatching when not waiting for any agent", () => {
+		const result = checkDispatchBlock(null, "worker");
+		assert.equal(result.block, false);
+	});
+});

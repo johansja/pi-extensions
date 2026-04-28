@@ -2,7 +2,7 @@
 name: reviewer
 description: Code review and testing specialist — scrutinizes quality, correctness, and test coverage
 tools: read, grep, find, ls
-roles: review, testing
+roles: review
 model: <your-preferred-model>
 thinking: high
 ---
