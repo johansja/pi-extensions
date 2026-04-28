@@ -80,7 +80,7 @@ interface DispatchEntry {
 interface TeamState {
 	task: string;
 	role: "orchestrator";
-	status: "active" | "shutdown" | "completed";
+	status: "active" | "shutdown";
 	agents: AgentRosterEntry[];
 	orchestratorPaneId: string | null;
 	surfaceIds: Record<string, string>;
@@ -88,6 +88,7 @@ interface TeamState {
 	originalSystemPrompt?: string;
 	pendingResumeContext?: string;
 	pendingTeamResume?: number; // timestamp (Date.now()) — auto-expires after 5 minutes
+	orchestratorSessionFile?: string;
 }
 
 interface WorkerState {
@@ -211,7 +212,16 @@ function loadState(cwd: string, task: string): TeamState | null {
 		if (state.status === undefined) {
 			(state as any).status = "active";
 		}
-		// Remove obsolete agentStatus field
+		// Backward compat: "completed" status no longer exists; treat as "shutdown"
+		if (state.status === "completed") {
+			(state as any).status = "shutdown";
+		}
+		// Backward compat: state files created before surfaceIds was added
+		if (state.surfaceIds === undefined) {
+			(state as any).surfaceIds = {};
+		}
+		// Backward compat: orchestratorSessionFile added in v2 — undefined is fine (no default needed)
+		// Remove obsolete fields
 		delete (state as any).agentStatus;
 		return state;
 	} catch (e) {
@@ -429,7 +439,7 @@ function terminalNotify(title: string, body: string): void {
 
 interface AvailableTeam {
 	task: string;
-	status: "active" | "shutdown" | "completed";
+	status: "active" | "shutdown";
 	agentCount: number;
 	lastActivity: number;
 	hasWorkingAgents: boolean;
@@ -447,30 +457,24 @@ function listAvailableTeams(cwd: string): AvailableTeam[] {
 		const entries = fs.readdirSync(workflowRoot, { withFileTypes: true });
 		for (const entry of entries) {
 			if (!entry.isDirectory()) continue;
-			const sp = path.join(workflowRoot, entry.name, "state.json");
-			try {
-				const content = fs.readFileSync(sp, "utf-8").trim();
-				if (!content) continue;
-				const state = JSON.parse(content) as TeamState;
-				const hasWorkingAgents = (state.dispatchHistory ?? []).some(d => !d.result);
-				let lastActivity = 0;
-				for (const d of (state.dispatchHistory ?? [])) {
-					if (d.timestamp > lastActivity) lastActivity = d.timestamp;
-				}
-				// Fallback to file mtime for new teams with no dispatches
-				if (lastActivity === 0) {
-					try { lastActivity = fs.statSync(sp).mtimeMs; } catch { /* ignore */ }
-				}
-				teams.push({
-					task: state.task ?? entry.name,
-					status: state.status ?? "active",
-					agentCount: (state.agents ?? []).length,
-					lastActivity,
-					hasWorkingAgents,
-				});
-			} catch {
-				// Invalid state file, skip
+			const state = loadState(cwd, entry.name);
+			if (!state) continue;
+			const hasWorkingAgents = (state.dispatchHistory ?? []).some(d => !d.result);
+			let lastActivity = 0;
+			for (const d of (state.dispatchHistory ?? [])) {
+				if (d.timestamp > lastActivity) lastActivity = d.timestamp;
 			}
+			// Fallback to file mtime for new teams with no dispatches
+			if (lastActivity === 0) {
+				try { lastActivity = fs.statSync(statePath(cwd, entry.name)).mtimeMs; } catch { /* ignore */ }
+			}
+			teams.push({
+				task: state.task ?? entry.name,
+				status: state.status,
+				agentCount: (state.agents ?? []).length,
+				lastActivity,
+				hasWorkingAgents,
+			});
 		}
 	} catch {
 		// workflow dir not readable
@@ -529,15 +533,19 @@ function buildResumeContext(state: TeamState): string {
 	return lines.join("\n");
 }
 
+function ensureResearchTools(pi: ExtensionAPI): void {
+	const researchTools = ["grep", "find", "ls"];
+	const current = pi.getActiveTools();
+	const missing = researchTools.filter((t) => !current.includes(t));
+	if (missing.length > 0) {
+		pi.setActiveTools([...current, ...missing]);
+	}
+}
+
 async function resumeTeam(pi: ExtensionAPI, ctx: ExtensionContext, taskName: string, onAgentComplete?: () => void): Promise<TeamState | null> {
 	const state = loadState(ctx.cwd, taskName);
 	if (!state) {
 		ctx.ui.notify(`No workflow state found for "${taskName}"`, "error");
-		return null;
-	}
-
-	if (state.status === "completed") {
-		ctx.ui.notify(`Team "${taskName}" is already completed. Use /team init to start a new team.`, "warning");
 		return null;
 	}
 
@@ -558,7 +566,7 @@ async function resumeTeam(pi: ExtensionAPI, ctx: ExtensionContext, taskName: str
 	}
 
 	// 3. Close orphaned cmux surfaces before clearing references
-	for (const [, surfaceId] of Object.entries(state.surfaceIds)) {
+	for (const [, surfaceId] of Object.entries(state.surfaceIds ?? {})) {
 		try {
 			await cmuxCloseSurface(surfaceId);
 		} catch {
@@ -660,7 +668,7 @@ async function resumeTeam(pi: ExtensionAPI, ctx: ExtensionContext, taskName: str
 	pi.setSessionName(orchLabel);
 	await cmuxRenameTab(undefined, orchLabel);
 
-	ensureResearchTools();
+	ensureResearchTools(pi);
 
 	// Store resume context as system-level info (not a user message) to avoid re-execution
 	const resumeContext = buildResumeContext(state);
@@ -822,8 +830,7 @@ async function spawnAgent(
 	const tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-team-"));
 	spawnedTempDirs.push(tmpDir);
 
-	try {
-		const contextFile = path.join(tmpDir, `context-${agent.name}.md`);
+	const contextFile = path.join(tmpDir, `context-${agent.name}.md`);
 		const contextContent = [
 			`# Team Working Protocol — ${agent.name}`,
 			``,
@@ -853,7 +860,7 @@ async function spawnAgent(
 		const args: string[] = [];
 		const isResume = sessionFile ? sessionFileHasData(sessionFile) : false;
 		if (sessionFile) args.push("--session", sessionFile);
-		if (agent.model) args.push("--model", agent.model);
+		if (!isResume && agent.model) args.push("--model", agent.model);
 		const validToolNames = new Set(["read", "bash", "edit", "write", "grep", "find", "ls"]);
 		if (agent.tools && agent.tools.length > 0) {
 			const invalidTools = agent.tools.filter(t => !validToolNames.has(t));
@@ -865,7 +872,7 @@ async function spawnAgent(
 				args.push("--tools", validTools.join(","));
 			}
 		}
-		if (agent.thinking) args.push("--thinking", agent.thinking);
+		if (!isResume && agent.thinking) args.push("--thinking", agent.thinking);
 		args.push("--append-system-prompt", agent.filePath);
 		args.push("--append-system-prompt", contextFile);
 
@@ -900,16 +907,6 @@ async function spawnAgent(
 		}
 
 		return { surfaceId };
-	} finally {
-		// Clean up temp context files immediately after spawn
-		try {
-			await fs.promises.rm(tmpDir, { recursive: true, force: true });
-		} catch {
-			// Best effort — session_shutdown will retry any remaining dirs
-		}
-		const idx = spawnedTempDirs.indexOf(tmpDir);
-		if (idx !== -1) spawnedTempDirs.splice(idx, 1);
-	}
 }
 
 // ─── Mailbox watching ────────────────────────────────────────────────────────
@@ -1031,8 +1028,10 @@ function setupMailboxWatching(
 			if (messages.length === 0) return;
 
 			if (role === "orchestrator") {
-				const hadResult = processOrchestratorMailbox(pi, ctx, task, messages);
-				if (hadResult) onAgentComplete?.();
+				// Clear waiting state BEFORE sendUserMessage can synchronously trigger
+				// the next LLM turn (and its tool_call events).
+				onAgentComplete?.();
+				processOrchestratorMailbox(pi, ctx, task, messages);
 			} else {
 				processWorkerMailbox(pi, ctx, task, role, messages);
 			}
@@ -1049,8 +1048,10 @@ function setupMailboxWatching(
 	const existingMessages = readMailbox(mp, ctx);
 	if (existingMessages.length > 0) {
 		if (role === "orchestrator") {
-			const hadResult = processOrchestratorMailbox(pi, ctx, task, existingMessages);
-			if (hadResult) onAgentComplete?.();
+			// Clear waiting state BEFORE sendUserMessage can synchronously trigger
+			// the next LLM turn (and its tool_call events).
+			onAgentComplete?.();
+			processOrchestratorMailbox(pi, ctx, task, existingMessages);
 		} else {
 			processWorkerMailbox(pi, ctx, task, role, existingMessages);
 		}
@@ -1116,15 +1117,6 @@ export default function teamExtension(pi: ExtensionAPI) {
 	let currentWorkerState: WorkerState | null = null;
 	let orchestratorWaitingFor: string | null = null; // agent name when tool is hidden
 
-
-	function ensureResearchTools(): void {
-		const researchTools = ["grep", "find", "ls"];
-		const current = pi.getActiveTools();
-		const missing = researchTools.filter((t) => !current.includes(t));
-		if (missing.length > 0) {
-			pi.setActiveTools([...current, ...missing]);
-		}
-	}
 
 
 	// ─── team_orchestrate tool (orchestrator only) ────────────────────────
@@ -1316,22 +1308,51 @@ export default function teamExtension(pi: ExtensionAPI) {
 					state.pendingTeamResume = undefined;
 					saveState(ctx.cwd, state);
 
+					orchestratorWaitingFor = null;
+					activeDispatches.clear();
 					// Perform the actual resume (repair state, re-spawn workers)
 					const resumed = await resumeTeam(pi, ctx, resumeTask, () => {
 						orchestratorWaitingFor = null;
 					});
-					if (resumed) currentTeamState = resumed;
+					if (resumed) {
+						currentTeamState = resumed;
 
-					// Update orchestrator session meta (new session file after switchSession)
-					if (ctx.sessionManager?.getSessionFile) {
-						const newSessionFile = ctx.sessionManager.getSessionFile();
-						if (newSessionFile) {
-							saveAgentSessionMeta(ctx.cwd, resumeTask, "orchestrator", newSessionFile);
+						// Update orchestrator session meta (new session file after switchSession)
+						if (ctx.sessionManager?.getSessionFile) {
+							const newSessionFile = ctx.sessionManager.getSessionFile();
+							if (newSessionFile) {
+								saveAgentSessionMeta(ctx.cwd, resumeTask, "orchestrator", newSessionFile);
+								resumed.orchestratorSessionFile = newSessionFile;
+								saveState(ctx.cwd, resumed);
+							}
 						}
 					}
 
 					return; // Skip the rest of session_start logic
 				}
+			}
+		}
+
+		// If we have an active team entry but no pending resume flag
+		// (e.g. after /reload), restore currentTeamState so shutdown
+		// and before_agent_start keep working correctly.
+		if (!currentTeamState && resumeTask) {
+			const fallbackState = loadState(ctx.cwd, resumeTask);
+			if (fallbackState && fallbackState.status === "active") {
+				currentTeamState = fallbackState;
+				setupMailboxWatching(pi, ctx, resumeTask, "orchestrator", () => {
+					orchestratorWaitingFor = null;
+				});
+				// Update session tracking for /reload resilience
+				if (ctx.sessionManager?.getSessionFile) {
+					const sessionFile = ctx.sessionManager.getSessionFile();
+					if (sessionFile) {
+						saveAgentSessionMeta(ctx.cwd, resumeTask, "orchestrator", sessionFile);
+						currentTeamState.orchestratorSessionFile = sessionFile;
+						saveState(ctx.cwd, currentTeamState);
+					}
+				}
+				// Surfaces will be respawned automatically on next dispatch
 			}
 		}
 
@@ -1364,19 +1385,19 @@ export default function teamExtension(pi: ExtensionAPI) {
 			if (state) {
 				ctx.ui.notify(`🔄 Previous team "${sessionTask}" found. Use /team resume ${sessionTask} to resume.`, "info");
 			}
-			return;
 		}
 
 		// Path 3: Notify about available teams from .pi/workflow/
-		const availableTeams = listAvailableTeams(ctx.cwd).filter(t => t.status === "active");
+		const availableTeams = listAvailableTeams(ctx.cwd);
 
 		if (availableTeams.length >= 1) {
 			const lines: string[] = availableTeams.length === 1
-				? ["🔄 Active team found:"]
-				: ["🔄 Multiple active teams found:"];
+				? ["🔄 Team found:"]
+				: ["🔄 Multiple teams found:"];
 			for (const team of availableTeams) {
+				const icon = team.status === "active" ? "🟢" : "🔴";
 				const timeStr = team.lastActivity > 0 ? new Date(team.lastActivity).toLocaleString() : "unknown";
-				lines.push(`  🟢 ${team.task} — Agents: ${team.agentCount} | Last: ${timeStr}`);
+				lines.push(`  ${icon} ${team.task} — Agents: ${team.agentCount} | Last: ${timeStr}`);
 			}
 			lines.push("");
 			lines.push("Use /team resume <task-name> to resume a team.");
@@ -1450,10 +1471,32 @@ export default function teamExtension(pi: ExtensionAPI) {
 	});
 
 	// ─── Safety net: block team_orchestrate while waiting for an agent ────
-	pi.on("tool_call", async (event, _ctx) => {
+	pi.on("tool_call", async (event, ctx) => {
 		if (event.toolName !== "team_orchestrate") return;
 
 		if (orchestratorWaitingFor && event.input.agent !== orchestratorWaitingFor) {
+			// Defensive: if module-level state is stale (race with mailbox watcher),
+			// check persisted state. If the "waiting" agent already has a result,
+			// self-heal and allow the dispatch.
+			const task = currentTeamState?.task ?? process.env.PI_TEAM_TASK;
+			if (task) {
+				try {
+					const state = loadState(ctx.cwd, task);
+					if (state) {
+						const waitingDispatch = state.dispatchHistory
+							.slice()
+							.reverse()
+							.find((d) => d.agent === orchestratorWaitingFor && !d.result);
+						if (!waitingDispatch) {
+							orchestratorWaitingFor = null;
+							return;
+						}
+					}
+				} catch {
+					// Best effort — fall through to block
+				}
+			}
+
 			return {
 				block: true,
 				reason: `"${orchestratorWaitingFor}" is still running. Wait for their result before dispatching a different agent. You can send additional instructions to the same agent if needed.`,
@@ -1472,18 +1515,31 @@ export default function teamExtension(pi: ExtensionAPI) {
 			const state = currentTeamState;
 			for (const agent of state.agents) {
 				const mp = mailboxPath(ctx.cwd, state.task, agent.name);
-				appendToMailbox(mp, {
-					type: "shutdown",
-					from: "orchestrator",
-					to: agent.name,
-					body: "Session shutting down.",
-					timestamp: Date.now(),
-				});
+				try {
+					appendToMailbox(mp, {
+						type: "shutdown",
+						from: "orchestrator",
+						to: agent.name,
+						body: "Session shutting down.",
+						timestamp: Date.now(),
+					});
+				} catch {
+					// Best effort — one failing mailbox shouldn't abort shutdown
+				}
 			}
 
-			// Close cmux surfaces
-			for (const surfaceId of Object.values(state.surfaceIds)) {
+			// Close cmux surfaces (defensive: surfaceIds may be undefined)
+			for (const surfaceId of Object.values(state.surfaceIds ?? {})) {
 				await cmuxCloseSurface(surfaceId);
+			}
+
+			// Persist shutdown status so future resumes know this team was cleanly ended
+			state.status = "shutdown";
+			state.surfaceIds = {};
+			try {
+				saveState(ctx.cwd, state);
+			} catch {
+				// Best effort — state may be in a broken format
 			}
 		}
 
@@ -1492,6 +1548,16 @@ export default function teamExtension(pi: ExtensionAPI) {
 		currentWorkerState = null;
 		orchestratorWaitingFor = null;
 		activeDispatches.clear();
+
+		// Clean up any temp dirs left behind by spawned agents
+		for (const dir of spawnedTempDirs) {
+			try {
+				await fs.promises.rm(dir, { recursive: true, force: true });
+			} catch {
+				// Best effort
+			}
+		}
+		spawnedTempDirs.length = 0;
 	});
 
 	// ─── Before agent start: inject orchestrator context ────────────────────
@@ -1584,8 +1650,10 @@ export default function teamExtension(pi: ExtensionAPI) {
 						return;
 					}
 
-					// Clear any leaked watchers from a previous team
+					// Clear any leaked state from a previous team
 					clearMailboxWatchers();
+					orchestratorWaitingFor = null;
+					activeDispatches.clear();
 
 					// Discover available agents
 					const discovery = discoverAgents(ctx.cwd, "both");
@@ -1695,11 +1763,13 @@ export default function teamExtension(pi: ExtensionAPI) {
 						const orchSession = ctx.sessionManager.getSessionFile();
 						if (orchSession) {
 							saveAgentSessionMeta(ctx.cwd, taskName, "orchestrator", orchSession);
+							currentTeamState!.orchestratorSessionFile = orchSession;
+							saveState(ctx.cwd, currentTeamState!);
 						}
 					}
 
 					const agentList = roster.map((a) => `  🔵 ${a.name} — ${a.description}`).join("\n");
-					ensureResearchTools();
+					ensureResearchTools(pi);
 					ctx.ui.notify(`Team initialized for "${taskName}"\nAgents:\n${agentList}\n\nDispatch agents using team_orchestrate.`, "info");
 					await cmuxLog("info", `Team initialized for ${taskName} with agents: ${roster.map((a) => a.name).join(", ")}`);
 					break;
@@ -1792,10 +1862,10 @@ export default function teamExtension(pi: ExtensionAPI) {
 
 						const lines: string[] = ["🔄 Available Teams:\n"];
 						for (const team of teams) {
-							const teamStatusIcon = team.status === "active" ? "🟢" : team.status === "shutdown" ? "🔴" : "✅";
+							const teamStatusIcon = team.status === "active" ? "🟢" : "🔴";
 							const workingTag = team.hasWorkingAgents ? " (has working agents)" : "";
 							const timeStr = team.lastActivity > 0 ? new Date(team.lastActivity).toLocaleString() : "unknown";
-							lines.push(`  ${teamStatusIcon} ${team.task} — ${team.status}${workingTag}`);
+							lines.push(`  ${teamStatusIcon} ${team.task}${workingTag}`);
 							lines.push(`     Agents: ${team.agentCount} | Last activity: ${timeStr}`);
 						}
 
@@ -1806,12 +1876,55 @@ export default function teamExtension(pi: ExtensionAPI) {
 						return;
 					}
 
-					// Clear any leaked watchers before resuming
+					// Clear any leaked state before resuming
 					clearMailboxWatchers();
+					orchestratorWaitingFor = null;
+					activeDispatches.clear();
 
-					// Try to load orchestrator session for conversation history restoration
-					const orchSessionFile = loadAgentSessionMeta(ctx.cwd, taskName, "orchestrator");
+					let orchSessionFile = loadAgentSessionMeta(ctx.cwd, taskName, "orchestrator");
+					if (!orchSessionFile) {
+						const state = loadState(ctx.cwd, taskName);
+						if (state?.orchestratorSessionFile && fs.existsSync(state.orchestratorSessionFile)) {
+							orchSessionFile = state.orchestratorSessionFile;
+							// Validate: the file must contain a team-orchestrator entry for this task
+							try {
+								const sm = SessionManager.open(orchSessionFile);
+								const entries = sm.getEntries();
+								const hasEntry = entries.some((e: any) => e.type === "custom" && e.customType === "team-orchestrator" && e.data?.task === taskName);
+								if (!hasEntry) {
+									orchSessionFile = null;
+								}
+							} catch {
+								orchSessionFile = null;
+							}
+						}
+					}
+					// Last resort: scan recent sessions for this task
+					if (!orchSessionFile) {
+						try {
+							const sessions = await SessionManager.list(ctx.cwd);
+							for (const session of sessions.slice(-20).reverse()) {
+								try {
+									const sm = SessionManager.open(session.file);
+									const entries = sm.getEntries();
+									const teamEntries = entries.filter((e: any) => e.type === "custom" && e.customType === "team-orchestrator");
+									const lastTeamEntry = teamEntries[teamEntries.length - 1];
+									if (lastTeamEntry?.data?.task === taskName) {
+										orchSessionFile = session.file;
+										break;
+									}
+								} catch {
+									// skip unreadable sessions
+								}
+							}
+						} catch {
+							// best effort
+						}
+					}
+
 					if (orchSessionFile) {
+						ctx.ui.notify(`Resuming orchestrator session from ${orchSessionFile}`, "info");
+
 						// Set pending flag so session_start auto-resumes after switchSession
 						const state = loadState(ctx.cwd, taskName);
 						if (state) {
@@ -1821,9 +1934,14 @@ export default function teamExtension(pi: ExtensionAPI) {
 
 						// Switch to the old session — this loads full conversation history
 						// and triggers session_start, which detects pendingTeamResume and calls resumeTeam()
-						await ctx.switchSession(orchSessionFile);
+						await ctx.switchSession(orchSessionFile, {
+							withSession: async (_replacedCtx) => {
+								// Intentionally empty — all post-switch work lives in `session_start`
+							},
+						});
 						return; // switchSession may not return normally
 					} else {
+						ctx.ui.notify(`No orchestrator session file found. Resuming team without conversation history. Agents will be respawned.`, "warning");
 						// No saved session file — fall back to direct resume (no history)
 						const resumed = await resumeTeam(pi, ctx, taskName);
 						if (resumed) currentTeamState = resumed;
@@ -1926,17 +2044,8 @@ export default function teamExtension(pi: ExtensionAPI) {
 						if (!fs.existsSync(teamDir)) continue;
 
 						found = true;
-						let status = "(unknown)";
-
-						try {
-							const content = fs.readFileSync(path.join(teamDir, "state.json"), "utf-8").trim();
-							if (content) {
-								const state = JSON.parse(content);
-								status = state.status ?? "(no status)";
-							}
-						} catch {
-							status = "(no state)";
-						}
+						const state = loadState(projectDir, targetTeam);
+						const status = state?.status ?? "(no state)";
 
 						const projectLabel = projectDir === ctx.cwd
 							? ""

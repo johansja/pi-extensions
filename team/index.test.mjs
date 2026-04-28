@@ -16,7 +16,7 @@ function sanitizeTaskName(task) {
 	const trimmed = task.trim();
 	if (!trimmed) return null;
 	if (trimmed.length < 1 || trimmed.length > 64) return null;
-	if (trimmed.includes("/") || trimmed.includes("\\") || trimmed.includes("..")) return null;
+	if (trimmed.includes("/") || trimmed.includes("\\") || trimmed.split(/[\/\\]/).includes("..")) return null;
 	return trimmed;
 }
 
@@ -90,6 +90,15 @@ function loadState(cwd, task) {
 		if (state.status === undefined) {
 			state.status = "active";
 		}
+		// Backward compat: "completed" status no longer exists; treat as "shutdown"
+		if (state.status === "completed") {
+			state.status = "shutdown";
+		}
+		if (state.surfaceIds === undefined) {
+			state.surfaceIds = {};
+		}
+		// Remove obsolete fields
+		delete state.agentStatus;
 		return state;
 	} catch {
 		return null;
@@ -253,7 +262,7 @@ describe("sanitizeTaskName", () => {
 		assert.equal(sanitizeTaskName("./foo"), null);
 		assert.equal(sanitizeTaskName("a/b"), null);
 		assert.equal(sanitizeTaskName("a\\b"), null);
-		assert.equal(sanitizeTaskName("foo..bar"), null);
+		assert.equal(sanitizeTaskName("foo..bar"), "foo..bar");
 	});
 
 	it("rejects names > 64 characters", () => {
@@ -382,13 +391,22 @@ describe("saveState / loadState round-trip", () => {
 		assert.equal(loaded, null);
 	});
 
-	it("backward compat: missing orchestratorPaneId become null", () => {
+	it("backward compat: missing orchestratorPaneId and surfaceIds become null and {}", () => {
 		const sp = statePath(tmpDir, "compat");
 		fs.mkdirSync(path.dirname(sp), { recursive: true });
 		fs.writeFileSync(sp, JSON.stringify({ task: "compat", status: "active" }), "utf-8");
 		const loaded = loadState(tmpDir, "compat");
 		assert.equal(loaded.orchestratorPaneId, null);
 		assert.equal(loaded.status, "active");
+		assert.deepEqual(loaded.surfaceIds, {});
+	});
+
+	it("backward compat: 'completed' status becomes 'shutdown'", () => {
+		const sp = statePath(tmpDir, "completed-compat");
+		fs.mkdirSync(path.dirname(sp), { recursive: true });
+		fs.writeFileSync(sp, JSON.stringify({ task: "completed-compat", status: "completed" }), "utf-8");
+		const loaded = loadState(tmpDir, "completed-compat");
+		assert.equal(loaded.status, "shutdown");
 	});
 
 	it("cleanup", () => {
