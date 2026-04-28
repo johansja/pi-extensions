@@ -155,7 +155,7 @@ function buildOrchestratorContext(state, extraInfo) {
 	lines.push("**Rules:**");
 	lines.push("- You MAY research, read files, analyze code, and design solutions yourself.");
 	lines.push("- You MUST NOT implement code or run tests yourself — dispatch the worker or reviewer.");
-	lines.push("- Dispatch ONE agent at a time. After dispatching, the agent runs in the background. Their result will be delivered to you automatically when they finish.");
+	lines.push("- You can send additional instructions to an agent that is still running. Do NOT dispatch a different agent until the current one reports back.");
 	lines.push("- When an agent finishes, briefly note their result, then dispatch the next agent. Do NOT re-analyze or re-review their work.");
 	lines.push("");
 

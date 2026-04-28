@@ -85,6 +85,7 @@ interface TeamState {
 	orchestratorPaneId: string | null;
 	surfaceIds: Record<string, string>;
 	dispatchHistory: DispatchEntry[];
+	originalSystemPrompt?: string;
 	pendingResumeContext?: string;
 	pendingTeamResume?: number; // timestamp (Date.now()) — auto-expires after 5 minutes
 }
@@ -111,7 +112,7 @@ function sanitizeTaskName(task: string): string | null {
 	const trimmed = task.trim();
 	if (!trimmed) return null;
 	if (trimmed.length < 1 || trimmed.length > CONFIG.TASK_NAME_MAX_LENGTH) return null;
-	if (trimmed.includes("/") || trimmed.includes("\\") || trimmed.includes("..")) return null;
+	if (trimmed.includes("/") || trimmed.includes("\\") || trimmed.split(/[\/\\]/).includes("..")) return null;
 	return trimmed;
 }
 
@@ -1114,7 +1115,7 @@ export default function teamExtension(pi: ExtensionAPI) {
 	let currentTeamState: TeamState | null = null;
 	let currentWorkerState: WorkerState | null = null;
 	let orchestratorWaitingFor: string | null = null; // agent name when tool is hidden
-	let dispatchAllowedInTurn = true; // per-turn gate — reset each turn_start
+
 
 	function ensureResearchTools(): void {
 		const researchTools = ["grep", "find", "ls"];
@@ -1409,24 +1410,14 @@ export default function teamExtension(pi: ExtensionAPI) {
 			return;
 		}
 
-		// Update dispatch history if we can find a matching entry
-		if (dispatchId) {
-			for (let i = state.dispatchHistory.length - 1; i >= 0; i--) {
-				if (state.dispatchHistory[i].dispatchId === dispatchId) {
-					if (!state.dispatchHistory[i].result) {
-						state.dispatchHistory[i].result = result;
-						state.dispatchHistory[i].stopReason = stopReason;
-					}
-					break;
-				}
-			}
-		} else {
-			for (let i = state.dispatchHistory.length - 1; i >= 0; i--) {
-				if (state.dispatchHistory[i].agent === role && !state.dispatchHistory[i].result) {
+		// Update dispatch history by dispatchId
+		for (let i = state.dispatchHistory.length - 1; i >= 0; i--) {
+			if (state.dispatchHistory[i].dispatchId === dispatchId) {
+				if (!state.dispatchHistory[i].result) {
 					state.dispatchHistory[i].result = result;
 					state.dispatchHistory[i].stopReason = stopReason;
-					break;
 				}
+				break;
 			}
 		}
 
@@ -1458,22 +1449,9 @@ export default function teamExtension(pi: ExtensionAPI) {
 		activeDispatches.delete(`${task}/${role}`);
 	});
 
-	// ─── Per-turn dispatch gate: prevent parallel dispatches in the same turn ─
-	pi.on("turn_start", async (_event, _ctx) => {
-		dispatchAllowedInTurn = true;
-	});
-
 	// ─── Safety net: block team_orchestrate while waiting for an agent ────
 	pi.on("tool_call", async (event, _ctx) => {
 		if (event.toolName !== "team_orchestrate") return;
-
-		if (!dispatchAllowedInTurn) {
-			return {
-				block: true,
-				reason: `🛑 DISPATCH BLOCKED: team_orchestrate was already called this turn. Only ONE dispatch allowed per turn. The previously dispatched agent is running. Wait — you will be re-invoked automatically.`,
-			};
-		}
-		dispatchAllowedInTurn = false;
 
 		if (orchestratorWaitingFor && event.input.agent !== orchestratorWaitingFor) {
 			return {
@@ -1540,9 +1518,12 @@ export default function teamExtension(pi: ExtensionAPI) {
 
 		currentTeamState = state;
 
-		return {
-			systemPrompt: event.systemPrompt + "\n\n" + context + resumeContext,
-		};
+		if (!state.originalSystemPrompt) {
+			state.originalSystemPrompt = event.systemPrompt;
+			saveState(ctx.cwd, state);
+		}
+		const systemPrompt = state.originalSystemPrompt + "\n\n" + context + resumeContext;
+		return { systemPrompt };
 	});
 
 	// ─── /team command ────────────────────────────────────────────────────
