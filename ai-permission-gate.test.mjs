@@ -65,6 +65,12 @@ function parseVerdict(raw) {
 	return { risk: "medium", reason: "Could not parse LLM verdict" };
 }
 
+function truncateCommand(command, maxLines = 5) {
+	const lines = command.split("\n");
+	if (lines.length <= maxLines) return command;
+	return lines.slice(0, maxLines).join("\n") + "\n…";
+}
+
 // ---------------------------------------------------------------------------
 // Read the source file for consistency and content tests
 // ---------------------------------------------------------------------------
@@ -222,6 +228,10 @@ describe("consistency with source file", () => {
 		assert.ok(match, "Could not find parseVerdict fallback in source file");
 		assert.equal(match[1], "medium", "Fallback risk should be 'medium'");
 	});
+
+	it("truncateCommand function exists in source file", () => {
+		assert.match(extensionSource, /function truncateCommand/);
+	});
 });
 
 describe("CWD-aware system prompt content", () => {
@@ -318,6 +328,43 @@ describe("CWD-aware system prompt content", () => {
 
 	it("does NOT include hasSystemEscapePattern", () => {
 		assert.doesNotMatch(extensionSource, /function hasSystemEscapePattern/);
+	});
+});
+
+describe("truncateCommand", () => {
+	it("returns the original string when ≤ 5 lines", () => {
+		const cmd = "line1\nline2\nline3\nline4\nline5";
+		assert.equal(truncateCommand(cmd), cmd);
+	});
+
+	it("truncates to 5 lines and appends \\n… when > 5 lines", () => {
+		const cmd = "line1\nline2\nline3\nline4\nline5\nline6";
+		const result = truncateCommand(cmd);
+		assert.equal(result, "line1\nline2\nline3\nline4\nline5\n…");
+	});
+
+	it("handles an empty string", () => {
+		assert.equal(truncateCommand(""), "");
+	});
+
+	it("handles a single-line command", () => {
+		assert.equal(truncateCommand("ls -la"), "ls -la");
+	});
+
+	it("handles a command with exactly 5 lines (should NOT append …)", () => {
+		const cmd = "a\nb\nc\nd\ne";
+		assert.equal(truncateCommand(cmd), cmd);
+	});
+
+	it("handles a command with exactly 6 lines (should append …)", () => {
+		const cmd = "a\nb\nc\nd\ne\nf";
+		const result = truncateCommand(cmd);
+		assert.equal(result, "a\nb\nc\nd\ne\n…");
+	});
+
+	it("respects a custom maxLines parameter", () => {
+		const cmd = "a\nb\nc\nd";
+		assert.equal(truncateCommand(cmd, 3), "a\nb\nc\n…");
 	});
 });
 

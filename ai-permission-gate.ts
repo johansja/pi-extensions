@@ -92,6 +92,12 @@ function riskLevelIndex(level: RiskLevel): number {
 	return RISK_LEVELS.indexOf(level);
 }
 
+function truncateCommand(command: string, maxLines: number = 5): string {
+	const lines = command.split("\n");
+	if (lines.length <= maxLines) return command;
+	return lines.slice(0, maxLines).join("\n") + "\n…";
+}
+
 function stripCodeFences(raw: string): string {
 	let text = raw.trim();
 	// Strip markdown code fences: ```json ... ``` or ``` ... ```
@@ -462,7 +468,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			notify("Pi", "Permission gate: awaiting input");
 			const choice = await ctx.ui.select(
-				`⚠️ AI safety check failed\n\n  ${command}\n\nThe LLM could not classify this command. Allow it?`,
+				`⚠️ AI safety check failed\n\n  ${truncateCommand(command)}\n\nThe LLM could not classify this command. Allow it?`,
 				["Yes", "No"],
 			);
 			if (choice !== "Yes") {
@@ -489,7 +495,7 @@ export default function (pi: ExtensionAPI) {
 			const riskEmoji = verdict.risk === "high" ? "🔴" : verdict.risk === "medium" ? "🟡" : "🟢";
 			notify("Pi", `Permission gate: ${verdict.risk} risk command`);
 			const choice = await ctx.ui.select(
-				`${riskEmoji} Potentially dangerous command (${verdict.risk} risk)\n\n  ${command}\n\n${verdict.reason}\n\nAllow?`,
+				`${riskEmoji} Potentially dangerous command (${verdict.risk} risk)\n\n  ${truncateCommand(command)}\n\n${verdict.reason}\n\nAllow?`,
 				["Yes", "No"],
 			);
 
