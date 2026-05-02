@@ -991,7 +991,7 @@ function processWorkerMailbox(
 				activeDispatches.set(`${task}/${role}`, msg.dispatchId);
 			}
 			const dispatchText = msg.instructions ?? msg.body ?? "New task from orchestrator";
-			pi.sendUserMessage(`Received message from "orchestrator":\n\n${dispatchText}`, { deliverAs: "followUp" });
+			pi.sendUserMessage(`Received message from "orchestrator":\n\n${dispatchText}`);
 		} else if (msg.type === "shutdown") {
 			ctx.ui.notify("🛑 Shutdown requested by orchestrator. Wrapping up.", "info");
 		}
