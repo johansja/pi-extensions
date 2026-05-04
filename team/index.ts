@@ -973,7 +973,7 @@ function processOrchestratorMailbox(
 	if (hasActionableMessage) {
 		// Send a user message to trigger the orchestrator's next turn
 		const fullMessage = parts.join("\n\n");
-		pi.sendUserMessage(fullMessage, { deliverAs: "followUp" });
+		pi.sendUserMessage(fullMessage, { deliverAs: "steer" });
 	}
 	return hasActionableMessage;
 }
@@ -991,7 +991,7 @@ function processWorkerMailbox(
 				activeDispatches.set(`${task}/${role}`, msg.dispatchId);
 			}
 			const dispatchText = msg.instructions ?? msg.body ?? "New task from orchestrator";
-			pi.sendUserMessage(`Received message from "orchestrator":\n\n${dispatchText}`);
+			pi.sendUserMessage(`Received message from "orchestrator":\n\n${dispatchText}`, { deliverAs: "steer" });
 		} else if (msg.type === "shutdown") {
 			ctx.ui.notify("🛑 Shutdown requested by orchestrator. Wrapping up.", "info");
 		}
